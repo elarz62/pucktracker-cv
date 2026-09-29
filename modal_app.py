@@ -38,7 +38,7 @@ OUTPUTS = ["tracks.csv", "teams.csv", "jersey.csv", "player_shifts.csv", "player
 
 @app.function(image=image, gpu="L4", volumes={str(DATA): volume}, timeout=3 * 60 * 60)
 def analyze(video_name: str, number: str = "21", team: str = "white", stride: int = 1,
-            tracker: str = "hockey_bytetrack.yaml") -> dict:
+            tracker: str = "hockey_bytetrack.yaml", start_s: float = 0.0, end_s: float = 0.0) -> dict:
     import time
 
     from pucktracker import classify, jersey, shifts, track
@@ -49,7 +49,8 @@ def analyze(video_name: str, number: str = "21", team: str = "white", stride: in
     timings = {}
 
     t = time.time()
-    track.main(video, str(out / "tracks.csv"), stride, tracker=f"/root/configs/{tracker}")
+    track.main(video, str(out / "tracks.csv"), stride, tracker=f"/root/configs/{tracker}",
+               start_s=start_s, end_s=end_s or None)
     timings["track_min"] = round((time.time() - t) / 60, 1)
 
     t = time.time()
@@ -65,13 +66,13 @@ def analyze(video_name: str, number: str = "21", team: str = "white", stride: in
 
 @app.local_entrypoint()
 def main(video: str, number: str = "21", team: str = "white", stride: int = 1,
-         tracker: str = "hockey_bytetrack.yaml"):
+         tracker: str = "hockey_bytetrack.yaml", start_s: float = 0.0, end_s: float = 0.0):
     src = pathlib.Path(video)
     with volume.batch_upload(force=True) as batch:
         batch.put_file(str(src), f"/videos/{src.name}")
     print(f"uploaded {src.name}")
 
-    result = analyze.remote(src.name, number, team, stride, tracker)
+    result = analyze.remote(src.name, number, team, stride, tracker, start_s, end_s)
     print(result)
 
     local = pathlib.Path("out") / src.stem

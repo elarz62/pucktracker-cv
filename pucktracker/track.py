@@ -18,18 +18,25 @@ def pan_dx(prev_gray, gray):
     return dx
 
 
-def main(video, out_csv, stride=1, model_name="yolo11s.pt", imgsz=1280, tracker="bytetrack.yaml"):
+def main(video, out_csv, stride=1, model_name="yolo11s.pt", imgsz=1280, tracker="bytetrack.yaml",
+         start_s=0.0, end_s=None):
+    """start_s/end_s limit tracking to the game (e.g. skip another team's ice time).
+    Frame numbers stay absolute, so times still match the source video."""
     model = YOLO(model_name)
     cap = cv2.VideoCapture(video)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     prev = None
     cum_dx = 0.0
-    frame_idx = 0
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    frame_idx = int(start_s * fps)
+    last_frame = int(end_s * fps) if end_s else total
+    if frame_idx:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     t0 = time.time()
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["frame", "track_id", "x1", "y1", "x2", "y2", "conf", "cam_dx"])
-        while True:
+        while frame_idx < last_frame:
             if frame_idx % stride:
                 if not cap.grab():
                     break
@@ -53,7 +60,7 @@ def main(video, out_csv, stride=1, model_name="yolo11s.pt", imgsz=1280, tracker=
             if (frame_idx - 1) % (stride * 240) == 0:
                 el = time.time() - t0
                 print(f"frame {frame_idx}/{total} elapsed {el/60:.1f} min "
-                      f"eta {el / frame_idx * (total - frame_idx) / 60:.0f} min", flush=True)
+                      f"eta {el / max(frame_idx - int(start_s * fps), 1) * (last_frame - frame_idx) / 60:.0f} min", flush=True)
     print(f"done: {frame_idx} frames in {(time.time()-t0)/60:.1f} min", flush=True)
 
 
