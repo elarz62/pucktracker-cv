@@ -1,0 +1,7 @@
+ultralytics==8.4.164
+opencv-python-headless
+pandas
+rapidocr-onnxruntime
+lap
+imageio-ffmpeg
+modal
