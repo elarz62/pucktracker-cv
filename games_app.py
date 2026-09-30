@@ -25,7 +25,7 @@ DATA = pathlib.Path("/data")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg")
-    .pip_install("fastapi[standard]==0.115.12", "aiofiles==24.1.0")
+    .pip_install("fastapi[standard]==0.115.12", "aiofiles==24.1.0", "pandas==2.2.3")
     .add_local_dir("games", "/root/games")
     .add_local_dir("web", "/root/web")
 )
@@ -88,6 +88,56 @@ def make_master(game_id: str, height: int = 720, crf: int = 23) -> dict:
     (d / "game.json").write_text(json.dumps(game, indent=2))
     vol.commit()
     return {"master": str(d / "master.mp4"), "mb": round((d / "master.mp4").stat().st_size / 1e6), **game}
+
+
+TEAM_CODE = {"white": "w", "blue": "b", "unknown": "u"}
+
+
+@app.function(image=image, volumes={str(DATA): vol}, cpu=4, memory=16384, timeout=60 * 60)
+def make_boxes(game_id: str, fps_out: int = 6) -> dict:
+    """Put the tracker's player boxes on the master timeline so people can click players in the video.
+
+    Writes boxes/<minute>.json ({time: [[track, x, y, w, h, team], ...]}, coordinates 0 to 1)
+    and boxes/tracks.json ({track: [start, end, team]}). Track ids are "<part>:<tracker id>".
+    """
+    import pandas as pd
+
+    game = load_game(game_id)
+    offs = offsets(game)
+    d = game_dir(game_id) / "boxes"
+    d.mkdir(parents=True, exist_ok=True)
+    minutes, spans, total = {}, {}, 0
+    for i, p in enumerate(game["parts"]):
+        src = DATA / "videos" / p["file"]
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                "stream=width,height,r_frame_rate", "-of", "json", str(src)], capture_output=True, text=True)
+        st = json.loads(probe.stdout)["streams"][0]
+        W, H = st["width"], st["height"]
+        num, den = st["r_frame_rate"].split("/")
+        fps = float(num) / float(den)
+        out = DATA / "out" / pathlib.Path(p["file"]).stem
+        tr = pd.read_csv(out / "tracks.csv")
+        teams = pd.read_csv(out / "teams.csv").set_index("track_id")["team"]
+        tr["team"] = tr["track_id"].map(teams).map(TEAM_CODE)
+        tr = tr[tr["team"].notna()]
+        tr["t"] = tr["frame"] / fps
+        tr = tr[(tr["t"] >= p["start"]) & (tr["t"] < p["end"])]
+        tr["mt"] = (offs[i] + tr["t"] - p["start"]).round(3)
+        step = max(1, round(fps / fps_out))
+        for tid, g in tr.groupby("track_id"):
+            spans[f"{i}:{tid}"] = [round(g["mt"].min(), 1), round(g["mt"].max(), 1), g["team"].iloc[0]]
+        keep = tr[(tr["frame"] % step) == 0]
+        for mt, g in keep.groupby("mt"):
+            key = f"{mt:.2f}"
+            rows = [[f"{i}:{r.track_id}", round(r.x1 / W, 4), round(r.y1 / H, 4), round((r.x2 - r.x1) / W, 4),
+                     round((r.y2 - r.y1) / H, 4), r.team] for r in g.itertuples()]
+            minutes.setdefault(int(mt // 60), {})[key] = rows
+            total += len(rows)
+    for m, frames in minutes.items():
+        (d / f"{m}.json").write_text(json.dumps(frames, separators=(",", ":")))
+    (d / "tracks.json").write_text(json.dumps(spans, separators=(",", ":")))
+    vol.commit()
+    return {"minutes": len(minutes), "tracks": len(spans), "boxes": total}
 
 
 def player_shifts(game_id: str, number: str) -> list:
@@ -215,7 +265,45 @@ def web():
                 "duration": g.get("duration") or x.get("duration"), "parts": g["parts"],
                 "offsets": g.get("offsets") or offsets(g), "drafts": x.get("drafts", {}), "ref": x.get("ref", {}),
                 "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or x.get("roster") or sorted(x.get("drafts", {}), key=int),
-                "marks": marks, "player_videos": players}
+                "marks": marks, "player_videos": players, "tags": read_tags(game_id),
+                "has_boxes": (game_dir(game_id) / "boxes" / "tracks.json").exists()}
+
+    def read_tags(game_id: str) -> dict:
+        p = game_dir(game_id) / "tags.json"
+        return json.loads(p.read_text()) if p.exists() else {}
+
+    @api.get("/api/games/{game_id}/tracks")
+    def tracks(game_id: str, req: Request):
+        check(req)
+        p = game_dir(game_id) / "boxes" / "tracks.json"
+        if game_id not in game_ids() or not p.exists():
+            raise HTTPException(404)
+        return FileResponse(p, media_type="application/json", headers={"Cache-Control": "private, max-age=86400"})
+
+    @api.get("/api/games/{game_id}/boxes/{minute}")
+    def boxes(game_id: str, minute: int, req: Request):
+        check(req)
+        p = game_dir(game_id) / "boxes" / f"{minute}.json"
+        if game_id not in game_ids() or not p.exists():
+            raise HTTPException(404)
+        return FileResponse(p, media_type="application/json", headers={"Cache-Control": "private, max-age=86400"})
+
+    @api.put("/api/games/{game_id}/tags")
+    async def save_tag(game_id: str, req: Request):
+        """Body {"track": "<part>:<id>", "number": "21"}; number null removes the tag."""
+        check(req)
+        body = await req.json()
+        track, number = str(body.get("track", "")), body.get("number")
+        if game_id not in game_ids() or not track or (number is not None and not str(number).isdigit()):
+            raise HTTPException(400)
+        tags = read_tags(game_id)
+        if number is None:
+            tags.pop(track, None)
+        else:
+            tags[track] = str(number)
+        (game_dir(game_id) / "tags.json").write_text(json.dumps(tags))
+        vol.commit()
+        return {"ok": True, "count": len(tags)}
 
     @api.put("/api/games/{game_id}/marks/{number}")
     async def save_marks(game_id: str, number: str, req: Request):

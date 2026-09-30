@@ -29,6 +29,7 @@
   --bg: #0e1522; --panel: #162033; --fg: #e6ecf5; --muted: #9aa8bf; --line: #2a3850;
   --red: #ef5a63; --blue: #6c9cf0; --ref: #7d8aa0; --good: #4cc38a; color-scheme: dark }
 * { box-sizing: border-box }
+[hidden] { display: none !important }
 body { background: var(--bg); color: var(--fg); font: 15px/1.5 var(--body); padding: 20px 16px 40px }
 .wrap { max-width: 980px; margin: 0 auto; display: grid; gap: 18px }
 header { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px }
@@ -94,6 +95,10 @@ select { font: 500 14px/1 var(--body); padding: 8px; border: 1px solid var(--lin
 a.btn { text-decoration: none }
 .save { font-size: 12px; color: var(--muted) }
 .save.err { color: var(--red) }
+.videobox canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none }
+.videobox.tagging canvas { pointer-events: auto; cursor: crosshair }
+button.tagon { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600 }
+.lane.tags .seg { background: var(--good) }
 .empty { color: var(--muted); font-size: 14px; padding: 10px 0 }
 .roster { display: flex; flex-wrap: wrap; gap: 6px; align-items: center }
 .roster button.p { font: 700 18px/1 var(--display); min-width: 46px; justify-content: center; padding: 8px 10px }
@@ -122,7 +127,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
   </section>
 
   <section class="panel">
-    <div class="videobox"><video id="vid" playsinline preload="metadata"></video></div>
+    <div class="videobox" id="vbox"><video id="vid" playsinline preload="metadata"></video><canvas id="boxes"></canvas></div>
 
     <div class="controls">
       <button id="play" title="Play or pause (Space)">Play <kbd>Space</kbd></button>
@@ -131,16 +136,18 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       <button id="speed" title="Playback speed (S)">1×</button>
       <button id="mark" class="on" title="Mark the selected player on or off the ice (M)">On ice <kbd>M</kbd></button>
       <span class="state" id="state">On bench</span>
+      <button id="tagBtn" title="Show players and click one to tag him (T)">Tag players <kbd>T</kbd></button>
       <span class="clock" id="clock">0:00</span>
     </div>
 
     <div class="lanes" id="lanes">
       <div class="lane mine"><span class="name">Your marks</span><div class="track" data-lane="mine"></div></div>
+      <div class="lane tags"><span class="name">Your tags</span><div class="track" data-lane="tags"></div></div>
       <div class="lane auto"><span class="name">Tracker</span><div class="track" data-lane="auto"></div></div>
       <div class="lane ref" id="refLane"><span class="name">LiveBarn</span><div class="track" data-lane="ref"></div></div>
     </div>
     <div class="ticks"><i></i><div id="ticks"></div></div>
-    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
+    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
   </section>
 
   <div class="grid2">
@@ -152,7 +159,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
           <tbody id="rows"></tbody>
         </table>
       </div>
-      <p class="note">Blue rows came from the tracker. Keep them, or mark the shift yourself and your mark replaces the blue row. Times are game clock from puck drop (video time, not the scoreboard).</p>
+      <p class="note">Blue rows came from the tracker, including stretches you tagged. Keep them, or mark the shift yourself and your mark replaces the blue row. Times are game clock from puck drop (video time, not the scoreboard).</p>
     </section>
 
     <section class="panel">
@@ -183,7 +190,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     <h2>Team</h2>
     <div class="tablewrap">
       <table>
-        <thead><tr><th>#</th><th>Shifts</th><th>Time on ice</th><th>Status</th><th>Video</th><th></th></tr></thead>
+        <thead><tr><th>#</th><th>Shifts</th><th>Time on ice</th><th>Tags</th><th>Status</th><th>Video</th><th></th></tr></thead>
         <tbody id="team"></tbody>
       </table>
     </div>
@@ -203,8 +210,20 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
 
   let G = null, gameId = null, dur = 3600, num = '21', roster = [], shifts = [], openIdx = -1;
   let marks = {};   // number -> shifts (server copy, updated as you mark)
+  let tags = {}, TR = {}, boxCache = {}, tagging = false;
+  const BOX_LAG = 0.3;   // tracker boxes trail the video by about this much
+  // Tracker draft plus every stretch where you tagged this player, joined when gaps are under 20 s.
+  function draftSpans(n) {
+    const iv = (G.drafts[n] || []).map(x => x.slice());
+    Object.entries(tags).forEach(([t, m]) => { if (m === n && TR[t]) iv.push([TR[t][0], TR[t][1]]); });
+    iv.sort((a, b) => a[0] - b[0]);
+    const out = [];
+    iv.forEach(([a, b]) => { const l = out[out.length - 1]; if (l && a - l[1] <= 20) l[1] = Math.max(l[1], b); else out.push([a, b]); });
+    return out.filter(([a, b]) => b - a >= 3);
+  }
+  const tagCount = n => Object.values(tags).filter(m => m === n).length;
 
-  const draft = n => (G.drafts[n] || []).map(([on, off]) => ({ on, off, src: 'auto' }));
+  const draft = n => draftSpans(n).map(([on, off]) => ({ on, off, src: 'auto' }));
   const listFor = n => marks[n] || draft(n);
   const reviewed = n => (marks[n] || []).some(s => s.src === 'mine');
   function toiOf(list) {
@@ -253,7 +272,8 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     const t = vid.currentTime || 0;
     const REF = G.ref[num] || [];
     drawLane(document.querySelector('[data-lane=mine]'), shifts.filter(s => s.src === 'mine').map(s => [s.on, s.off ?? t, s.off == null]));
-    drawLane(document.querySelector('[data-lane=auto]'), G.drafts[num] || []);
+    drawLane(document.querySelector('[data-lane=auto]'), draftSpans(num));
+    drawLane(document.querySelector('[data-lane=tags]'), Object.entries(tags).filter(([t, m]) => m === num && TR[t]).map(([t]) => TR[t]));
     drawLane(document.querySelector('[data-lane=ref]'), REF);
     $('refLane').hidden = !REF.length;
     const rows = shifts.map((s, i) => ({ ...s, i })).sort((a, b) => a.on - b.on);
@@ -279,7 +299,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
         out.push([gameId, n, k + 1, s.on.toFixed(1), s.off.toFixed(1), (s.off - s.on).toFixed(1), s.src === 'auto' ? 'tracker' : 'parent'].join(',')));
       const x = toiOf(list), rv = n === num ? shifts.some(s => s.src === 'mine') : reviewed(n);
       const hasVid = G.player_videos[n];
-      team.push(`<tr class="${n === num ? 'cur' : ''}"><td>#${n}</td><td>${x.n}</td><td>${fmt(x.toi)}</td>
+      team.push(`<tr class="${n === num ? 'cur' : ''}"><td>#${n}</td><td>${x.n}</td><td>${fmt(x.toi)}</td><td>${tagCount(n) || ''}</td>
         <td class="src"><span class="chip ${rv ? 'm' : 'a'}">${rv ? 'Reviewed' : 'Draft'}</span></td>
         <td class="src">${hasVid ? `<a href="/video/${gameId}/players/${n}.mp4?v=${Math.round(hasVid)}" target="_blank" rel="noopener">Watch</a>` : ''}</td>
         <td><div class="row-actions"><button data-n="${n}" ${n === num ? 'disabled' : ''}>Mark</button></div></td></tr>`);
@@ -332,7 +352,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     if (openIdx >= 0) { const s = shifts[openIdx]; s.off = +vid.currentTime.toFixed(1); if (s.off <= s.on) shifts.splice(openIdx, 1); openIdx = -1; save(); }
     num = n; lsSet('player', n);
     shifts = listFor(n).map(s => ({ ...s })); openIdx = shifts.findIndex(s => s.off == null);
-    $('who').textContent = '#' + n; drawRoster(); render();
+    $('who').textContent = '#' + n; drawRoster(); render(); drawBoxes();
   }
   function addNum() {
     const v = String(parseInt($('addNum').value, 10)); if (!/^\d{1,2}$/.test(v)) return;
@@ -353,6 +373,9 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       try { const v = JSON.parse(loc); if (JSON.stringify(v) !== JSON.stringify(marks[n] || null) && !G.marks[n]) { marks[n] = v; pending[n] = true; } } catch (e) {}
     });
     if (Object.keys(pending).length) flush();
+    tags = G.tags || {}; TR = {}; boxCache = {};
+    if (G.has_boxes) fetch(`/api/games/${id}/tracks`).then(r => r.ok ? r.json() : {}).then(j => { TR = j; if (!marks[num]) shifts = listFor(num).map(s => ({ ...s })); render(); });
+    $('tagBtn').hidden = !G.has_boxes;
     roster = G.roster.slice();
     try { const extra = JSON.parse(lsGet('roster:' + id)); if (Array.isArray(extra)) extra.forEach(n => roster.includes(n) || roster.push(n)); } catch (e) {}
     Object.keys(marks).forEach(n => roster.includes(n) || roster.push(n));
@@ -364,9 +387,63 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     ticks(); selectPlayer(num); setSave('All marks saved');
   }
 
+  // ---- Click-to-tag: draw the tracker's boxes over the video and let people label them.
+  const cv = $('boxes'), ctx = cv.getContext('2d');
+  function frameAt(t) {
+    const m = Math.floor(t / 60);
+    if (!(m in boxCache)) { boxCache[m] = null; fetch(`/api/games/${gameId}/boxes/${m}`).then(r => r.ok ? r.json() : {}).then(j => { boxCache[m] = { keys: Object.keys(j).map(Number).sort((a, b) => a - b), j }; drawBoxes(); }); }
+    const c = boxCache[m]; if (!c || !c.keys.length) return [];
+    let lo = 0, hi = c.keys.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (c.keys[mid] < t) lo = mid + 1; else hi = mid; }
+    const k = [c.keys[Math.max(0, lo - 1)], c.keys[lo]].reduce((a, b) => Math.abs(b - t) < Math.abs(a - t) ? b : a);
+    return Math.abs(k - t) < 0.3 ? c.j[k.toFixed(2)] || [] : [];
+  }
+  function videoRect() {
+    const W = cv.clientWidth, H = cv.clientHeight, vw = vid.videoWidth || 16, vh = vid.videoHeight || 9;
+    const s = Math.min(W / vw, H / vh); return { x: (W - vw * s) / 2, y: (H - vh * s) / 2, w: vw * s, h: vh * s, W, H };
+  }
+  let shown = [];
+  function drawBoxes() {
+    const r = videoRect(), dpr = window.devicePixelRatio || 1;
+    if (cv.width !== Math.round(r.W * dpr)) { cv.width = Math.round(r.W * dpr); cv.height = Math.round(r.H * dpr); }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, r.W, r.H); shown = [];
+    if (!tagging || !G) return;
+    const css = getComputedStyle(document.documentElement);
+    frameAt(vid.currentTime - BOX_LAG).forEach(([id, x, y, w, h, team]) => {
+      if (team === 'b') return;
+      const bx = { id, x: r.x + x * r.w, y: r.y + y * r.h, w: w * r.w, h: h * r.h }; shown.push(bx);
+      const tg = tags[id], mine = tg === num;
+      ctx.lineWidth = mine ? 3 : 1.5;
+      ctx.strokeStyle = mine ? '#ef5a63' : tg ? '#4cc38a' : 'rgba(255,255,255,.85)';
+      ctx.strokeRect(bx.x, bx.y, bx.w, bx.h);
+      if (tg) { ctx.font = '600 13px ' + css.getPropertyValue('--mono'); const lbl = '#' + tg, tw = ctx.measureText(lbl).width + 6;
+        ctx.fillStyle = ctx.strokeStyle; ctx.fillRect(bx.x, bx.y - 17, tw, 16); ctx.fillStyle = '#fff'; ctx.fillText(lbl, bx.x + 3, bx.y - 4); }
+    });
+  }
+  function setTagging(on) {
+    tagging = on; $('vbox').classList.toggle('tagging', on); $('tagBtn').classList.toggle('tagon', on);
+    if (on) vid.pause(); drawBoxes();
+  }
+  $('tagBtn').onclick = () => setTagging(!tagging);
+  cv.addEventListener('click', async e => {
+    const rc = cv.getBoundingClientRect(), px = e.clientX - rc.left, py = e.clientY - rc.top;
+    const hit = shown.filter(b => px >= b.x - 4 && px <= b.x + b.w + 4 && py >= b.y - 4 && py <= b.y + b.h + 4).sort((a, b) => a.w * a.h - b.w * b.h)[0];
+    if (!hit) { vid.paused ? vid.play() : vid.pause(); return; }
+    const before = tags[hit.id], next = before === num ? null : num;
+    if (next) tags[hit.id] = next; else delete tags[hit.id];
+    if (!reviewed(num) && !shifts.some(s => s.src === 'mine')) shifts = draft(num);
+    drawBoxes(); render(); setSave('Saving tag…');
+    try {
+      const r = await fetch(`/api/games/${gameId}/tags`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track: hit.id, number: next }) });
+      if (!r.ok) throw new Error(r.status); setSave('Tag saved');
+    } catch (err) { if (before) tags[hit.id] = before; else delete tags[hit.id]; drawBoxes(); render(); setSave('Tag not saved. Check your connection and try again.', true); }
+  });
+  window.addEventListener('resize', drawBoxes);
+  vid.addEventListener('seeked', drawBoxes);
+
   vid.addEventListener('loadedmetadata', () => { dur = vid.duration || dur; ticks(); render(); });
   let lastPos = 0;
-  vid.addEventListener('timeupdate', () => { render(); if (Math.abs(vid.currentTime - lastPos) > 5) { lastPos = vid.currentTime; lsSet('pos:' + gameId, lastPos.toFixed(1)); } });
+  vid.addEventListener('timeupdate', () => { render(); drawBoxes(); if (Math.abs(vid.currentTime - lastPos) > 5) { lastPos = vid.currentTime; lsSet('pos:' + gameId, lastPos.toFixed(1)); } });
   vid.addEventListener('play', () => $('play').innerHTML = 'Pause <kbd>Space</kbd>');
   vid.addEventListener('pause', () => $('play').innerHTML = 'Play <kbd>Space</kbd>');
   $('play').onclick = () => vid.src && (vid.paused ? vid.play() : vid.pause());
@@ -395,6 +472,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     else if (e.key === 'ArrowRight') seek(vid.currentTime + 5);
     else if (e.key === 'm' || e.key === 'M') toggle();
     else if (e.key === 's' || e.key === 'S') $('speed').click();
+    else if ((e.key === 't' || e.key === 'T') && G && G.has_boxes) setTagging(!tagging);
     else if (e.key === '[' || e.key === ']') { const i = roster.indexOf(num) + (e.key === ']' ? 1 : -1); selectPlayer(roster[(i + roster.length) % roster.length]); }
   });
   $('copy').onclick = () => {
