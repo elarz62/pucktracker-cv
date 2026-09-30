@@ -265,7 +265,7 @@ def web():
                 "duration": g.get("duration") or x.get("duration"), "parts": g["parts"],
                 "offsets": g.get("offsets") or offsets(g), "drafts": x.get("drafts", {}), "ref": x.get("ref", {}),
                 "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or x.get("roster") or sorted(x.get("drafts", {}), key=int),
-                "marks": marks, "player_videos": players, "tags": read_tags(game_id),
+                "marks": marks, "player_videos": players, "tags": read_tags(game_id), "known": x.get("known", {}),
                 "has_boxes": (game_dir(game_id) / "boxes" / "tracks.json").exists()}
 
     def read_tags(game_id: str) -> dict:
