@@ -90,13 +90,15 @@ def make_master(game_id: str, height: int = 720, crf: int = 23) -> dict:
     return {"master": str(d / "master.mp4"), "mb": round((d / "master.mp4").stat().st_size / 1e6), **game}
 
 
-TEAM_CODE = {"white": "w", "blue": "b", "unknown": "u"}
+TEAM_CODE = {"white": "w", "blue": "b", "unknown": "u", "ref": "r", "stands": "s"}
 
 
 @app.function(image=image, volumes={str(DATA): vol}, cpu=4, memory=16384, timeout=60 * 60)
-def make_boxes(game_id: str, fps_out: int = 6) -> dict:
+def make_boxes(game_id: str, fps_out: int = 6, lags: list = None) -> dict:
     """Put the tracker's player boxes on the master timeline so people can click players in the video.
 
+    lags: seconds each part's boxes trail the master video (measured by matching fresh detections on the
+    master against the tracker's boxes; the Sep 26 files measured 0.1, 0.25 and 0.4).
     Writes boxes/<minute>.json ({time: [[track, x, y, w, h, team], ...]}, coordinates 0 to 1)
     and boxes/tracks.json ({track: [start, end, team]}). Track ids are "<part>:<tracker id>".
     """
@@ -119,10 +121,14 @@ def make_boxes(game_id: str, fps_out: int = 6) -> dict:
         tr = pd.read_csv(out / "tracks.csv")
         teams = pd.read_csv(out / "teams.csv").set_index("track_id")["team"]
         tr["team"] = tr["track_id"].map(teams).map(TEAM_CODE)
-        tr = tr[tr["team"].notna()]
+        tr["team"] = tr["team"].fillna("u")
+        # "Stands" is often a player the color check got wrong; keep it unless the box sits up in the seats.
+        low = (tr["y2"] / H).groupby(tr["track_id"]).median()
+        tr = tr[(tr["team"] != "s") | tr["track_id"].map(low).gt(0.3)]
         tr["t"] = tr["frame"] / fps
         tr = tr[(tr["t"] >= p["start"]) & (tr["t"] < p["end"])]
-        tr["mt"] = (offs[i] + tr["t"] - p["start"]).round(3)
+        lag = (lags or game.get("box_lags") or [0.0] * len(game["parts"]))[i]
+        tr["mt"] = (offs[i] + tr["t"] - p["start"] + lag).round(3)
         step = max(1, round(fps / fps_out))
         for tid, g in tr.groupby("track_id"):
             spans[f"{i}:{tid}"] = [round(g["mt"].min(), 1), round(g["mt"].max(), 1), g["team"].iloc[0]]

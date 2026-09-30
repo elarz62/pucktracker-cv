@@ -147,7 +147,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       <div class="lane ref" id="refLane"><span class="name">LiveBarn</span><div class="track" data-lane="ref"></div></div>
     </div>
     <div class="ticks"><i></i><div id="ticks"></div></div>
-    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing).</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
+    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing). Faint dashed boxes are players the tracker thinks are on the other team or a referee; you can still tag them.</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
   </section>
 
   <div class="grid2">
@@ -211,7 +211,6 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
   let G = null, gameId = null, dur = 3600, num = '21', roster = [], shifts = [], openIdx = -1;
   let marks = {};   // number -> shifts (server copy, updated as you mark)
   let tags = {}, TR = {}, boxCache = {}, tagging = false;
-  const BOX_LAG = 0.3;   // tracker boxes trail the video by about this much
   // Tracker draft plus every stretch where you tagged this player, joined when gaps are under 20 s.
   function draftSpans(n) {
     const iv = (G.drafts[n] || []).map(x => x.slice());
@@ -409,14 +408,14 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, r.W, r.H); shown = [];
     if (!tagging || !G) return;
     const css = getComputedStyle(document.documentElement);
-    frameAt(vid.currentTime - BOX_LAG).forEach(([id, x, y, w, h, team]) => {
-      if (team === 'b') return;
+    frameAt(vid.currentTime).forEach(([id, x, y, w, h, team]) => {
+      const other = team === 'b' || team === 'r';   // blue team or referee, by jersey color
       const bx = { id, x: r.x + x * r.w, y: r.y + y * r.h, w: w * r.w, h: h * r.h }; shown.push(bx);
       // Your tag wins; otherwise show what the number reader saw (sure, or a guess with "?").
       const tg = tags[id], kn = !tg && G.known && G.known[id], n = tg || (kn && kn[0]), mine = n === num;
       ctx.lineWidth = mine ? 3 : 1.5;
-      ctx.strokeStyle = tg ? (mine ? '#ef5a63' : '#1f9a5e') : kn ? (kn[1] === 'a' ? '#2b6fd6' : 'rgba(43,111,214,.7)') : 'rgba(255,255,255,.85)';
-      if (kn && kn[1] === 'g') ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = tg ? (mine ? '#ef5a63' : '#1f9a5e') : kn ? (kn[1] === 'a' ? '#2b6fd6' : 'rgba(43,111,214,.7)') : other ? 'rgba(255,255,255,.35)' : 'rgba(255,255,255,.85)';
+      if ((kn && kn[1] === 'g') || (other && !tg)) ctx.setLineDash([4, 3]);
       ctx.strokeRect(bx.x, bx.y, bx.w, bx.h); ctx.setLineDash([]);
       if (n) { ctx.font = '600 13px ' + css.getPropertyValue('--mono'); const lbl = '#' + n + (kn && kn[1] === 'g' ? '?' : ''), tw = ctx.measureText(lbl).width + 6;
         ctx.fillStyle = ctx.strokeStyle; ctx.fillRect(bx.x, bx.y - 17, tw, 16); ctx.fillStyle = '#fff'; ctx.fillText(lbl, bx.x + 3, bx.y - 4); }
