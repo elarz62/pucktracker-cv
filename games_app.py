@@ -214,7 +214,7 @@ def web():
         return {"id": game_id, "title": g.get("title"), "team_color": g.get("team_color"),
                 "duration": g.get("duration") or x.get("duration"), "parts": g["parts"],
                 "offsets": g.get("offsets") or offsets(g), "drafts": x.get("drafts", {}), "ref": x.get("ref", {}),
-                "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or sorted(x.get("drafts", {}), key=int),
+                "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or x.get("roster") or sorted(x.get("drafts", {}), key=int),
                 "marks": marks, "player_videos": players}
 
     @api.put("/api/games/{game_id}/marks/{number}")
