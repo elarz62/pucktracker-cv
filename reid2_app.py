@@ -31,7 +31,8 @@ def game_dir(game_id):
 
 
 def tags_for(game_id):
-    t = json.loads((game_dir(game_id) / "tags.json").read_text())
+    f = game_dir(game_id) / "tags.json"
+    t = json.loads(f.read_text()) if f.exists() else {}
     return {k: v for k, v in t.items() if v.isdigit() and v != "10"}
 
 
@@ -46,7 +47,9 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
     stem = pathlib.Path(p["file"]).stem
     tr = pd.read_csv(DATA / src / stem / "tracks.csv")
     teams = pd.read_csv(DATA / src / stem / "teams.csv").set_index("track_id")["team"]
-    tr = tr[(tr.frame >= p["start"] * 24) & (tr.frame < p["end"] * 24)]
+    cap = cv2.VideoCapture(str(DATA / "videos" / p["file"]))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24
+    tr = tr[(tr.frame >= p["start"] * fps) & (tr.frame < p["end"] * fps)]
     tagged = {int(k.split(":")[1]) for k in tags_for(game_id) if k.startswith(f"{part}:")} if src == "out" else set()
     n = tr.groupby("track_id").size()
     keep = [t for t in n.index if t in tagged or (teams.get(t) in ("white", "unknown") and n[t] >= 12)]
@@ -56,7 +59,6 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
         rows = g.iloc[np.linspace(0, len(g) - 1, min(PER_TRACK, len(g))).astype(int)]
         for r in rows.itertuples():
             want.setdefault(int(r.frame), []).append((t, r.x1, r.y1, r.x2, r.y2))
-    cap = cv2.VideoCapture(str(DATA / "videos" / p["file"]))
     frames = sorted(want)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frames[0])
     f = frames[0]
@@ -83,7 +85,8 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
 def load(game_id, src="out"):
     import numpy as np
     ids, ims = [], []
-    for part in range(3):
+    n = len(json.loads((game_dir(game_id) / "game.json").read_text())["parts"])
+    for part in range(n):
         z = np.load(game_dir(game_id) / f"reid_crops_{src}_{part}.npz")
         ids += list(z["ids"]); ims.append(z["ims"])
     return np.array(ids), np.concatenate(ims)
@@ -253,11 +256,50 @@ def fill(game_id: str, epochs: int = 8) -> dict:
             "conf>=0.5": sum(1 for v in out.values() if v[1] >= 0.5)}
 
 
+@app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=8, memory=49152, timeout=3 * 60 * 60)
+def predict(game_id: str, model_game: str) -> dict:
+    """Use the model trained on model_game to guess every track in game_id: writes guesses.json."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    vol.reload()
+    ck = torch.load(game_dir(model_game) / "reid_model.pt", map_location="cuda")
+    m = backbone().cuda()
+    for b, sd in zip(m.blocks[-4:], ck["blocks"]):
+        b.load_state_dict(sd)
+    m.norm.load_state_dict(ck["norm"])
+    head = nn.Linear(768, len(ck["classes"])).cuda()
+    head.load_state_dict(ck["head"])
+    m.eval()
+    mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+    ids, ims = load(game_id)
+    P = []
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for k in range(0, len(ims), 256):
+            x = torch.from_numpy(ims[k:k + 256]).cuda().permute(0, 3, 1, 2).float() / 255
+            P.append(torch.softmax(head(m((x - mean) / std)).float(), 1).cpu())
+    P = torch.cat(P).numpy()
+    out = {}
+    for t, p in track_scores(ids, P).items():
+        j = int(p.argmax())
+        out[str(t)] = [ck["classes"][j], round(float(p[j]), 3)]
+    (game_dir(game_id) / "guesses.json").write_text(json.dumps(out, separators=(",", ":")))
+    vol.commit()
+    return {"guessed": len(out), "conf>=0.5": sum(1 for v in out.values() if v[1] >= 0.5)}
+
+
 @app.local_entrypoint()
-def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8, mode: str = "test"):
+def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8, mode: str = "test",
+         model_game: str = "2026-09-26"):
     if not skip_crops:
-        for r in crops.starmap([(game_id, k) for k in range(3)]):
+        n = len(json.load(open(f"games/{game_id}.json"))["parts"])
+        for r in crops.starmap([(game_id, k) for k in range(n)]):
             print("CROPS", r, flush=True)
+    if mode == "predict":
+        print("PREDICT", json.dumps(predict.remote(game_id, model_game)), flush=True)
+        return
     if mode == "fill":
         print("FILL", json.dumps(fill.remote(game_id, epochs)), flush=True)
         return

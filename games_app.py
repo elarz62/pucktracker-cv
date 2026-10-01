@@ -20,6 +20,7 @@ import modal
 
 app = modal.App("pucktracker-games")
 vol = modal.Volume.from_name("pucktracker-videos", create_if_missing=True)
+TAGS = modal.Dict.from_name("pucktracker-tags", create_if_missing=True)   # {game id: {track: tag}}
 DATA = pathlib.Path("/data")
 
 image = (
@@ -286,8 +287,14 @@ def web():
         return [k for k, (flips, dark, _) in json.loads(p.read_text()).items() if flips >= 10 and 0.25 <= dark <= 0.75]
 
     def read_tags(game_id: str) -> dict:
-        p = game_dir(game_id) / "tags.json"
-        return json.loads(p.read_text()) if p.exists() else {}
+        # The Dict is the source of truth: the volume copy in this container can be stale while a video
+        # streams (reload is skipped), and writing a stale copy back would undo other jobs' changes.
+        t = TAGS.get(game_id)
+        if t is None:
+            p = game_dir(game_id) / "tags.json"
+            t = json.loads(p.read_text()) if p.exists() else {}
+            TAGS[game_id] = t
+        return t
 
     @api.get("/api/games/{game_id}/tracks")
     def tracks(game_id: str, req: Request):
@@ -320,7 +327,8 @@ def web():
             tags.pop(track, None)
         else:
             tags[track] = str(number)
-        (game_dir(game_id) / "tags.json").write_text(json.dumps(tags))
+        TAGS[game_id] = tags
+        (game_dir(game_id) / "tags.json").write_text(json.dumps(tags))   # copy for batch jobs
         vol.commit()
         return {"ok": True, "count": len(tags)}
 
@@ -398,3 +406,12 @@ def web():
         return send_video(game_dir(game_id) / "players" / f"{number}.mp4", req, f"{game_id}-{number}.mp4")
 
     return api
+
+
+@app.function(image=image, volumes={str(DATA): vol}, timeout=600)
+def set_tags(game_id: str, tags: dict) -> dict:
+    """Replace a game's tags everywhere (used after re-tracking moves tags to new track ids)."""
+    TAGS[game_id] = tags
+    (game_dir(game_id) / "tags.json").write_text(json.dumps(tags))
+    vol.commit()
+    return {"count": len(tags)}

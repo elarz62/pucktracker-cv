@@ -23,12 +23,12 @@ DATA = pathlib.Path("/data")
 
 
 @app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=4, memory=16384, timeout=4 * 60 * 60)
-def retrack(file: str, start_s: float, end_s: float, tracker: str = "hockey_bytetrack_hold.yaml") -> dict:
+def retrack(file: str, start_s: float, end_s: float, tracker: str = "hockey_bytetrack_hold.yaml", outdir: str = "out_hold") -> dict:
     import time
 
     from pucktracker import classify, track
 
-    out = DATA / "out_hold" / pathlib.Path(file).stem
+    out = DATA / outdir / pathlib.Path(file).stem
     out.mkdir(parents=True, exist_ok=True)
     video = str(DATA / "videos" / file)
     t = time.time()
@@ -41,8 +41,8 @@ def retrack(file: str, start_s: float, end_s: float, tracker: str = "hockey_byte
 
 
 @app.local_entrypoint()
-def main(game_id: str = "2026-09-26", pad: float = 15):
+def main(game_id: str = "2026-09-26", pad: float = 15, outdir: str = "out_hold"):
     game = json.load(open(f"games/{game_id}.json"))
-    jobs = [(p["file"], max(0.0, p["start"] - pad), p["end"] + pad) for p in game["parts"]]
+    jobs = [(p["file"], max(0.0, p["start"] - pad), p["end"] + pad, "hockey_bytetrack_hold.yaml", outdir) for p in game["parts"]]
     for r in retrack.starmap(jobs):
         print("DONE", r, flush=True)

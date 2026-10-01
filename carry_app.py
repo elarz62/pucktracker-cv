@@ -14,9 +14,11 @@ import modal
 
 app = modal.App("pucktracker-carry")
 vol = modal.Volume.from_name("pucktracker-videos")
-image = modal.Image.debian_slim(python_version="3.11").pip_install("pandas", "numpy").add_local_dir("games", "/root/games")
+image = modal.Image.debian_slim(python_version="3.11").apt_install("ffmpeg").pip_install("pandas", "numpy").add_local_dir("games", "/root/games")
 DATA = pathlib.Path("/data")
 SPLIT_BASE = 1_000_000   # ids for cut pieces of a new track
+MARGIN = 24              # frames a carried label reaches past the tagged boxes it came from
+BRIDGE = 24 * 10         # same kid on both sides of a gap up to 10 s: the gap is that kid too
 
 
 def iou(a, b):
@@ -48,42 +50,62 @@ def carry_part(old, new, labels):
         runs = []
         if t in lab_by_track:
             for f, l in zip(lab_by_track[t].frame.values, lab_by_track[t].lab.values):
-                if runs and runs[-1][2] == l:
+                if runs and runs[-1][2] == l and f - runs[-1][1] <= BRIDGE:
                     runs[-1][1] = f
                 else:
                     runs.append([f, f, l])
-        # short label blips (< 1 s) inside a longer run are box swaps at a crossing; drop them
-        runs = [r for r in runs if r[1] - r[0] >= 24 or len(runs) == 1] or runs
+        # short label blips (< 1 s) next to longer runs are box swaps at a crossing; drop them
+        if len(runs) > 1:
+            runs = [r for r in runs if r[1] - r[0] >= 24] or runs
         merged = []
         for r in runs:
-            if merged and merged[-1][2] == r[2]:
+            if merged and merged[-1][2] == r[2] and r[0] - merged[-1][1] <= BRIDGE:
                 merged[-1][1] = r[1]
             else:
                 merged.append(list(r))
-        if len(merged) <= 1:
-            if merged:
-                out_labels[int(t)] = merged[0][2]
+        # A label only covers the stretch it was seen on (plus a second each side). Before, after and
+        # between runs, the track may have jumped to another kid while holding, so those stretches stay
+        # unlabeled pieces for the model to guess.
+        f0, f1 = int(g.frame.min()), int(g.frame.max())
+        segs, cur = [], f0
+        for r0, r1, l in merged:
+            a0, a1 = max(cur, r0 - MARGIN), min(f1, r1 + MARGIN)
+            if a0 > cur:
+                segs.append([cur, a0 - 1, None])
+            segs.append([a0, a1, l])
+            cur = a1 + 1
+        if cur <= f1:
+            segs.append([cur, f1, None])
+        if len(segs) == 1:
+            if segs[0][2] is not None:
+                out_labels[int(t)] = segs[0][2]
             if t in best_old.index:
                 out_best[int(t)] = int(best_old[t])
             continue
-        # cut halfway between runs of different kids
-        cuts = [(a[1] + b[0]) // 2 for a, b in zip(merged, merged[1:])]
+        starts = np.array([sg[0] for sg in segs])
         frames = g.frame.values
-        piece = np.searchsorted(cuts, frames, side="right")
+        k_of = np.searchsorted(starts, frames, side="right") - 1
         ids = []
-        for k in range(len(merged)):
+        for sg in segs:
             ids.append(next_id); next_id += 1
-            out_labels[ids[-1]] = merged[k][2]
-        new.loc[g.index, "piece"] = [ids[k] for k in piece]
+            if sg[2] is not None:
+                out_labels[ids[-1]] = sg[2]
+        new.loc[g.index, "piece"] = [ids[k] for k in k_of]
         sub = m[m.track_id == t]
-        for k, pid in enumerate(ids):
-            lo = cuts[k - 1] if k else -1
-            hi = cuts[k] if k < len(cuts) else 10 ** 9
-            s = sub[(sub.frame > lo) & (sub.frame <= hi)]
-            if len(s):
-                out_best[pid] = int(s.track_id_o.value_counts().idxmax())
+        for sg, pid in zip(segs, ids):
+            s_ = sub[(sub.frame >= sg[0]) & (sub.frame <= sg[1])]
+            if len(s_):
+                out_best[pid] = int(s_.track_id_o.value_counts().idxmax())
     new["track_id"] = new.piece
     return new.drop(columns="piece"), out_labels, out_best
+
+
+def fps_of(path):
+    import subprocess
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout.strip()
+    a, b = r.split("/")
+    return float(a) / float(b)
 
 
 def spans(tr, ids, off, start, gap=2.0):
@@ -127,10 +149,14 @@ def run(game_id: str, apply: bool = False) -> dict:
     vol.reload()
     g = DATA / "games" / game_id
     game = json.loads((g / "game.json").read_text())
-    tags = json.loads((g / "tags.json").read_text())
-    drafts = json.loads(pathlib.Path(f"/root/games/{game_id}.drafts.json").read_text())
-    known = drafts.get("known", {})
-    refs = json.loads((g / "refs.json").read_text()) if (g / "refs.json").exists() else {}
+    # Labels always come from the original run (v1) once it has been swapped out.
+    src = g / "v1" if (g / "v1" / "tags.json").exists() else g
+    tags = json.loads((src / "tags.json").read_text())
+    if (g / "v1" / "known.json").exists():
+        known = json.loads((g / "v1" / "known.json").read_text())
+    else:
+        known = json.loads(pathlib.Path(f"/root/games/{game_id}.drafts.json").read_text()).get("known", {})
+    refs = json.loads((src / "refs.json").read_text()) if (src / "refs.json").exists() else {}
     marks = {p.stem: [[s["on"], s["off"]] for s in json.loads(p.read_text())["shifts"] if s.get("off") is not None]
              for p in (g / "marks").glob("*.json")}
     v2 = g / "v2"
@@ -141,7 +167,8 @@ def run(game_id: str, apply: bool = False) -> dict:
     for i, p in enumerate(game["parts"]):
         stem = pathlib.Path(p["file"]).stem
         off = game["offsets"][i]
-        old = pd.read_csv(DATA / "out" / stem / "tracks.csv")
+        old_root = DATA / "out_v1" if (DATA / "out_v1" / stem).exists() else DATA / "out"
+        old = pd.read_csv(old_root / stem / "tracks.csv")
         new = pd.read_csv(DATA / "out_hold" / stem / "tracks.csv")
         lo, hi = p["start"] * 24, p["end"] * 24
         old = old[(old.frame >= lo) & (old.frame < hi)]
@@ -196,7 +223,7 @@ def run(game_id: str, apply: bool = False) -> dict:
         backup = g / "v1"
         backup.mkdir(exist_ok=True)
         for f in ("tags.json", "refs.json"):
-            if (g / f).exists():
+            if (g / f).exists() and not (backup / f).exists():
                 shutil.copy(g / f, backup / f)
         for i, p in enumerate(game["parts"]):
             stem = pathlib.Path(p["file"]).stem
@@ -214,44 +241,57 @@ def run(game_id: str, apply: bool = False) -> dict:
 
 
 @app.function(image=image, volumes={str(DATA): vol}, cpu=8, memory=32768, timeout=3600)
-def drafts(game_id: str, thrs: list = (1.1, 0.7, 0.5, 0.3), gaps: list = (10, 20, 40), min_len: float = 3) -> dict:
+def drafts(game_id: str, thrs: list = (1.0, 0.7, 0.5, 0.3), gaps: list = (10, 20, 40), min_len: float = 3) -> dict:
     """Shift drafts for every kid from tags, sure number reads and the model's guesses (at or above thr),
-    scored against every marked player. thr 1.1 means tags and reads only."""
+    scored against every marked player. thr 1.0 means tags and reads only."""
     import pandas as pd
 
     vol.reload()
     g = DATA / "games" / game_id
     game = json.loads((g / "game.json").read_text())
-    tags = json.loads((g / "tags.json").read_text())
+    tags = json.loads((g / "tags.json").read_text()) if (g / "tags.json").exists() else {}
     known = json.loads((g / "v2" / "known.json").read_text()) if (g / "v2" / "known.json").exists() else {}
     guesses = json.loads((g / "guesses.json").read_text()) if (g / "guesses.json").exists() else {}
     marks = {p.stem: [[s["on"], s["off"]] for s in json.loads(p.read_text())["shifts"] if s.get("off") is not None]
              for p in (g / "marks").glob("*.json")}
     marks = {n: m for n, m in marks.items() if length(m) >= 300}
-    vis = {}   # (source, number) -> visible intervals
+    vis = {}   # number -> [(start, end, confidence)]
+    accepted = {}
     for i, p in enumerate(game["parts"]):
         stem = pathlib.Path(p["file"]).stem
+        fps = fps_of(DATA / "videos" / p["file"])
         tr = pd.read_csv(DATA / "out" / stem / "tracks.csv", usecols=["frame", "track_id"])
-        tr = tr[(tr.frame >= p["start"] * 24) & (tr.frame < p["end"] * 24)]
-        sp = {}
-        for t, fr in tr.groupby("track_id").frame:
-            sp[f"{i}:{t}"] = (fr.values, )
-        for k, (fr,) in sp.items():
-            src = None
+        tr = tr[(tr.frame >= p["start"] * fps) & (tr.frame < p["end"] * fps)]
+        sp = {f"{i}:{t}": fr.values for t, fr in tr.groupby("track_id").frame}
+        firm, cands = [], []
+        for k, fr in sp.items():
             if tags.get(k, "").isdigit():
-                src, n, c = "tag", tags[k], 1.0
+                firm.append((k, tags[k], fr))
             elif k in tags:
                 continue
             elif k in known and known[k][1] == "a":
-                src, n, c = "read", known[k][0], 1.0
+                firm.append((k, known[k][0], fr))
             elif k in guesses:
-                src, n, c = "model", guesses[k][0], guesses[k][1]
-            if not src or n == "10":
+                cands.append((guesses[k][1], k, guesses[k][0], fr))
+        # One kid can't be in two places: a guess loses to a tag or read of the same number at the same
+        # time, and to a more confident guess.
+        busy = {}
+        for k, n, fr in firm:
+            busy.setdefault(n, set()).update(fr.tolist())
+        rows = [(k, n, fr, 1.0) for k, n, fr in firm]
+        for c, k, n, fr in sorted(cands, reverse=True):
+            b = busy.setdefault(n, set())
+            if sum(f in b for f in fr) > 0.2 * len(fr):
                 continue
-            ts = sorted(set(fr))
+            b.update(fr.tolist())
+            rows.append((k, n, fr, c))
+            accepted[k] = [n, c]
+        for k, n, fr, c in rows:
+            if n == "10":
+                continue
             iv = []
-            for f in ts:
-                t = game["offsets"][i] + f / 24 - p["start"]
+            for f in sorted(set(fr)):
+                t = game["offsets"][i] + f / fps - p["start"]
                 if iv and t - iv[-1][1] <= 2:
                     iv[-1][1] = t
                 else:
@@ -271,7 +311,7 @@ def drafts(game_id: str, thrs: list = (1.1, 0.7, 0.5, 0.3), gaps: list = (10, 20
         for gap in gaps:
             out[f"{thr}_{gap}"] = {n: [[round(a, 1), round(b, 1)] for a, b in union([(a, b) for a, b, c in v if c >= thr], gap) if b - a >= min_len]
                                    for n, v in vis.items()}
-    return {"table": table, "drafts": out}
+    return {"table": table, "drafts": out, "accepted_guesses": accepted}
 
 
 @app.local_entrypoint()
@@ -281,6 +321,7 @@ def main(game_id: str = "2026-09-26", apply: bool = False, mode: str = "carry"):
         for row in r["table"]:
             print("SCORE", json.dumps(row))
         pathlib.Path(f"/tmp/drafts_{game_id}.json").write_text(json.dumps(r["drafts"]))
+        pathlib.Path(f"/tmp/guesses_{game_id}.json").write_text(json.dumps(r["accepted_guesses"]))
         return
     r = run.remote(game_id, apply)
     print("REPORT", json.dumps(r))
