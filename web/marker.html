@@ -394,14 +394,35 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
 
   // ---- Click-to-tag: draw the tracker's boxes over the video and let people label them.
   const cv = $('boxes'), ctx = cv.getContext('2d');
-  function frameAt(t) {
-    const m = Math.floor(t / 60);
+  // Boxes come at 6 per second; slide each box between the two samples around the current frame
+  // so it moves with the player instead of jumping 6 times a second.
+  function minuteOf(m) {
+    if (m < 0) return null;
     if (!(m in boxCache)) { boxCache[m] = null; fetch(`/api/games/${gameId}/boxes/${m}`).then(r => r.ok ? r.json() : {}).then(j => { boxCache[m] = { keys: Object.keys(j).map(Number).sort((a, b) => a - b), j }; drawBoxes(); }); }
-    const c = boxCache[m]; if (!c || !c.keys.length) return [];
-    let lo = 0, hi = c.keys.length - 1;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (c.keys[mid] < t) lo = mid + 1; else hi = mid; }
-    const k = [c.keys[Math.max(0, lo - 1)], c.keys[lo]].reduce((a, b) => Math.abs(b - t) < Math.abs(a - t) ? b : a);
-    return Math.abs(k - t) < 0.3 ? c.j[k.toFixed(2)] || [] : [];
+    const c = boxCache[m]; return c && c.keys.length ? c : null;
+  }
+  function sampleAround(t) {   // [time, rows] just before and just after t (may cross a minute)
+    const m = Math.floor(t / 60), c = minuteOf(m); let a = null, b = null;
+    if (c) {
+      let lo = 0, hi = c.keys.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (c.keys[mid] <= t) lo = mid + 1; else hi = mid; }
+      if (lo > 0) a = [c.keys[lo - 1], c.j[c.keys[lo - 1].toFixed(2)] || []];
+      if (lo < c.keys.length) b = [c.keys[lo], c.j[c.keys[lo].toFixed(2)] || []];
+    }
+    if (!a) { const p = minuteOf(m - 1); if (p) { const k = p.keys[p.keys.length - 1]; a = [k, p.j[k.toFixed(2)] || []]; } }
+    if (!b && t - m * 60 > 59.5) { const n = minuteOf(m + 1); if (n) { const k = n.keys[0]; b = [k, n.j[k.toFixed(2)] || []]; } }
+    return [a, b];
+  }
+  function frameAt(t) {
+    const [a, b] = sampleAround(t);
+    if (a && b && b[0] - a[0] < 0.6) {
+      const f = (t - a[0]) / (b[0] - a[0]), nb = {}; b[1].forEach(r => nb[r[0]] = r);
+      const out = a[1].map(r => { const q = nb[r[0]]; return q ? [r[0], r[1] + (q[1] - r[1]) * f, r[2] + (q[2] - r[2]) * f, r[3] + (q[3] - r[3]) * f, r[4] + (q[4] - r[4]) * f, r[5]] : f < 0.5 ? r : null; }).filter(Boolean);
+      const have = new Set(a[1].map(r => r[0])); if (f >= 0.5) b[1].forEach(r => have.has(r[0]) || out.push(r));
+      return out;
+    }
+    const near = [a, b].filter(x => x && Math.abs(x[0] - t) < 0.3).sort((x, y) => Math.abs(x[0] - t) - Math.abs(y[0] - t))[0];
+    return near ? near[1] : [];
   }
   function videoRect() {
     const W = cv.clientWidth, H = cv.clientHeight, vw = vid.videoWidth || 16, vh = vid.videoHeight || 9;
@@ -472,6 +493,13 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     } catch (err) { if (before) tags[id] = before; else delete tags[id]; drawBoxes(); render(); setSave('Tag not saved. Check your connection and try again.', true); }
   }
   window.addEventListener('resize', drawBoxes);
+  // While playing, redraw on every video frame (timeupdate only fires about 4 times a second).
+  function boxLoop() {
+    if (!tagging || vid.paused) return;
+    drawBoxes();
+    if (vid.requestVideoFrameCallback) vid.requestVideoFrameCallback(boxLoop); else requestAnimationFrame(boxLoop);
+  }
+  vid.addEventListener('play', boxLoop);
   vid.addEventListener('seeked', drawBoxes);
 
   vid.addEventListener('loadedmetadata', () => { dur = vid.duration || dur; ticks(); render(); });
