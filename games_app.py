@@ -273,7 +273,9 @@ def web():
                 "offsets": g.get("offsets") or offsets(g), "drafts": x.get("drafts", {}), "ref": x.get("ref", {}),
                 "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or x.get("roster") or sorted(x.get("drafts", {}), key=int),
                 "marks": marks, "player_videos": players, "tags": read_tags(game_id), "known": x.get("known", {}), "refs": read_refs(game_id),
-                "has_boxes": (game_dir(game_id) / "boxes" / "tracks.json").exists()}
+                "has_boxes": (game_dir(game_id) / "boxes" / "tracks.json").exists(),
+                # Changes whenever boxes are rebuilt, so browsers don't keep showing a cached old copy.
+                "boxes_v": int((game_dir(game_id) / "boxes" / "tracks.json").stat().st_mtime) if (game_dir(game_id) / "boxes" / "tracks.json").exists() else 0}
 
     def read_refs(game_id: str) -> list:
         """Tracks with a referee's black-and-white stripes (reid_app.find_refs). At 10+ flips per row

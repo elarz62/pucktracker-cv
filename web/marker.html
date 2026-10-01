@@ -379,7 +379,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     });
     if (Object.keys(pending).length) flush();
     tags = G.tags || {}; TR = {}; boxCache = {}; REFS = new Set(G.refs || []);
-    if (G.has_boxes) fetch(`/api/games/${id}/tracks`).then(r => r.ok ? r.json() : {}).then(j => { TR = j; if (!marks[num]) shifts = listFor(num).map(s => ({ ...s })); render(); });
+    if (G.has_boxes) fetch(`/api/games/${id}/tracks?v=${G.boxes_v || 0}`).then(r => r.ok ? r.json() : {}).then(j => { TR = j; if (!marks[num]) shifts = listFor(num).map(s => ({ ...s })); render(); });
     $('tagBtn').hidden = !G.has_boxes;
     roster = G.roster.slice();
     try { const extra = JSON.parse(lsGet('roster:' + id)); if (Array.isArray(extra)) extra.forEach(n => roster.includes(n) || roster.push(n)); } catch (e) {}
@@ -398,7 +398,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
   // so it moves with the player instead of jumping 6 times a second.
   function minuteOf(m) {
     if (m < 0) return null;
-    if (!(m in boxCache)) { boxCache[m] = null; fetch(`/api/games/${gameId}/boxes/${m}`).then(r => r.ok ? r.json() : {}).then(j => { boxCache[m] = { keys: Object.keys(j).map(Number).sort((a, b) => a - b), j }; drawBoxes(); }); }
+    if (!(m in boxCache)) { boxCache[m] = null; fetch(`/api/games/${gameId}/boxes/${m}?v=${G.boxes_v || 0}`).then(r => r.ok ? r.json() : {}).then(j => { boxCache[m] = { keys: Object.keys(j).map(Number).sort((a, b) => a - b), j }; drawBoxes(); }); }
     const c = boxCache[m]; return c && c.keys.length ? c : null;
   }
   function sampleAround(t) {   // [time, rows] just before and just after t (may cross a minute)
