@@ -104,6 +104,48 @@ def track_scores(ids, P):
     return out
 
 
+def finetune(m, Xtr, y, n_classes, epochs, prep):
+    """Fine-tune the last 4 DINOv2 blocks plus a linear head on crops Xtr with labels y (ints)."""
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    dev = "cuda"
+    for p in m.parameters():
+        p.requires_grad = False
+    for blk in m.blocks[-4:]:
+        for p in blk.parameters():
+            p.requires_grad = True
+    for p in m.norm.parameters():
+        p.requires_grad = True
+    head = nn.Linear(768, n_classes).to(dev)
+    params = [p for p in m.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW([{"params": params, "lr": 2e-5}, {"params": head.parameters(), "lr": 1e-3}], weight_decay=0.05)
+    ytr = torch.tensor(y, device=dev)
+    # balance kids: sample each crop with weight 1 / (crops of that kid)
+    cnt = np.bincount(np.array(y), minlength=n_classes)
+    w = 1.0 / cnt[np.array(y)]
+    w = w / w.sum()
+    steps = epochs * len(Xtr) // 64
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[2e-5, 1e-3], total_steps=steps)
+    rng = np.random.default_rng(0)
+    loss_f = nn.CrossEntropyLoss(label_smoothing=0.1)
+    m.train()
+    for s in range(steps):
+        b = rng.choice(len(Xtr), 64, p=w)
+        x = prep(Xtr[b])
+        if rng.random() < 0.5:
+            x = x.flip(3)
+        # brightness/contrast jitter and a random shift
+        x = x * (1 + 0.2 * (torch.rand(len(b), 1, 1, 1, device=dev) - 0.5)) + 0.2 * (torch.rand(len(b), 1, 1, 1, device=dev) - 0.5)
+        dy, dx = rng.integers(-12, 13), rng.integers(-8, 9)
+        x = torch.roll(x, shifts=(int(dy), int(dx)), dims=(2, 3))
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = loss_f(head(m(x)), ytr[b])
+        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+    m.eval()
+    return head
+
+
 @app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=8, memory=49152, timeout=3 * 60 * 60)
 def fold(game_id: str, test_part: int, epochs: int = 8) -> dict:
     import numpy as np
@@ -158,38 +200,7 @@ def fold(game_id: str, test_part: int, epochs: int = 8) -> dict:
     res["frozen"], _, _ = score(clf.predict_proba(F_te), list(clf.classes_))
 
     # 2) fine-tune the last 4 blocks + a linear head, with augmentation
-    for p in m.parameters():
-        p.requires_grad = False
-    for blk in m.blocks[-4:]:
-        for p in blk.parameters():
-            p.requires_grad = True
-    for p in m.norm.parameters():
-        p.requires_grad = True
-    head = nn.Linear(768, len(classes)).to(dev)
-    params = [p for p in m.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW([{"params": params, "lr": 2e-5}, {"params": head.parameters(), "lr": 1e-3}], weight_decay=0.05)
-    Xtr, ytr = ims[train], torch.tensor([ci[c] for c in lab[train]], device=dev)
-    # balance kids: sample each crop with weight 1 / (crops of that kid)
-    cnt = np.bincount(ytr.cpu().numpy(), minlength=len(classes))
-    w = 1.0 / cnt[ytr.cpu().numpy()]
-    w = w / w.sum()
-    steps = epochs * len(Xtr) // 64
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[2e-5, 1e-3], total_steps=steps)
-    rng = np.random.default_rng(0)
-    loss_f = nn.CrossEntropyLoss(label_smoothing=0.1)
-    m.train()
-    for s in range(steps):
-        b = rng.choice(len(Xtr), 64, p=w)
-        x = prep(Xtr[b])
-        if rng.random() < 0.5:
-            x = x.flip(3)
-        # brightness/contrast jitter and a random shift
-        x = x * (1 + 0.2 * (torch.rand(len(b), 1, 1, 1, device=dev) - 0.5)) + 0.2 * (torch.rand(len(b), 1, 1, 1, device=dev) - 0.5)
-        dy, dx = rng.integers(-12, 13), rng.integers(-8, 9)
-        x = torch.roll(x, shifts=(int(dy), int(dx)), dims=(2, 3))
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = loss_f(head(m(x)), ytr[b])
-        opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+    head = finetune(m, ims[train], [ci[c] for c in lab[train]], len(classes), epochs, prep)
     m.eval()
     with torch.no_grad():
         F = torch.from_numpy(feats(m, ims[test])).to(dev)
@@ -199,11 +210,57 @@ def fold(game_id: str, test_part: int, epochs: int = 8) -> dict:
     return res
 
 
+@app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=8, memory=49152, timeout=3 * 60 * 60)
+def fill(game_id: str, epochs: int = 8) -> dict:
+    """Train on every tag, then guess every untagged track: writes guesses.json {track: [number, confidence]}
+    and saves the model (reid_model.pt) for the next game."""
+    import numpy as np
+    import torch
+
+    vol.reload()
+    tags = tags_for(game_id)
+    ids, ims = load(game_id)
+    lab = np.array([tags.get(t, "") for t in ids])
+    train = lab != ""
+    classes = sorted(set(lab[train]), key=int)
+    ci = {c: k for k, c in enumerate(classes)}
+    dev = "cuda"
+    mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+
+    def prep(x):
+        x = torch.from_numpy(x).to(dev).permute(0, 3, 1, 2).float() / 255
+        return (x - mean) / std
+
+    m = backbone().to(dev)
+    head = finetune(m, ims[train], [ci[c] for c in lab[train]], len(classes), epochs, prep)
+    every = set(json.loads((game_dir(game_id) / "tags.json").read_text()))   # includes x and ?
+    rest = np.array([t not in every for t in ids])
+    R, P = ims[rest], []
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for k in range(0, len(R), 256):
+            P.append(torch.softmax(head(m(prep(R[k:k + 256]))).float(), 1).cpu())
+    P = torch.cat(P).numpy() if P else np.zeros((0, len(classes)))
+    out = {}
+    for t, p in track_scores(ids[rest], P).items():
+        j = int(p.argmax())
+        out[str(t)] = [classes[j], round(float(p[j]), 3)]
+    (game_dir(game_id) / "guesses.json").write_text(json.dumps(out, separators=(",", ":")))
+    torch.save({"classes": classes, "head": head.state_dict(), "blocks": [b.state_dict() for b in m.blocks[-4:]],
+                "norm": m.norm.state_dict()}, game_dir(game_id) / "reid_model.pt")
+    vol.commit()
+    return {"trained_on_tracks": int(len(set(ids[train]))), "guessed": len(out),
+            "conf>=0.5": sum(1 for v in out.values() if v[1] >= 0.5)}
+
+
 @app.local_entrypoint()
-def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8):
+def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8, mode: str = "test"):
     if not skip_crops:
         for r in crops.starmap([(game_id, k) for k in range(3)]):
             print("CROPS", r, flush=True)
+    if mode == "fill":
+        print("FILL", json.dumps(fill.remote(game_id, epochs)), flush=True)
+        return
     out = list(fold.starmap([(game_id, k, epochs) for k in range(3)]))
     for r in out:
         print("FOLD", json.dumps(r), flush=True)

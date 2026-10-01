@@ -213,7 +213,74 @@ def run(game_id: str, apply: bool = False) -> dict:
     return report
 
 
+@app.function(image=image, volumes={str(DATA): vol}, cpu=8, memory=32768, timeout=3600)
+def drafts(game_id: str, thrs: list = (1.1, 0.7, 0.5, 0.3), gaps: list = (10, 20, 40), min_len: float = 3) -> dict:
+    """Shift drafts for every kid from tags, sure number reads and the model's guesses (at or above thr),
+    scored against every marked player. thr 1.1 means tags and reads only."""
+    import pandas as pd
+
+    vol.reload()
+    g = DATA / "games" / game_id
+    game = json.loads((g / "game.json").read_text())
+    tags = json.loads((g / "tags.json").read_text())
+    known = json.loads((g / "v2" / "known.json").read_text()) if (g / "v2" / "known.json").exists() else {}
+    guesses = json.loads((g / "guesses.json").read_text()) if (g / "guesses.json").exists() else {}
+    marks = {p.stem: [[s["on"], s["off"]] for s in json.loads(p.read_text())["shifts"] if s.get("off") is not None]
+             for p in (g / "marks").glob("*.json")}
+    marks = {n: m for n, m in marks.items() if length(m) >= 300}
+    vis = {}   # (source, number) -> visible intervals
+    for i, p in enumerate(game["parts"]):
+        stem = pathlib.Path(p["file"]).stem
+        tr = pd.read_csv(DATA / "out" / stem / "tracks.csv", usecols=["frame", "track_id"])
+        tr = tr[(tr.frame >= p["start"] * 24) & (tr.frame < p["end"] * 24)]
+        sp = {}
+        for t, fr in tr.groupby("track_id").frame:
+            sp[f"{i}:{t}"] = (fr.values, )
+        for k, (fr,) in sp.items():
+            src = None
+            if tags.get(k, "").isdigit():
+                src, n, c = "tag", tags[k], 1.0
+            elif k in tags:
+                continue
+            elif k in known and known[k][1] == "a":
+                src, n, c = "read", known[k][0], 1.0
+            elif k in guesses:
+                src, n, c = "model", guesses[k][0], guesses[k][1]
+            if not src or n == "10":
+                continue
+            ts = sorted(set(fr))
+            iv = []
+            for f in ts:
+                t = game["offsets"][i] + f / 24 - p["start"]
+                if iv and t - iv[-1][1] <= 2:
+                    iv[-1][1] = t
+                else:
+                    iv.append([t, t])
+            vis.setdefault(n, []).extend([(a, b, c) for a, b in iv])
+    table, best = [], None
+    for thr in thrs:
+        for gap in gaps:
+            row = {"thr": thr, "gap": gap}
+            for n, mk in marks.items():
+                d = [x for x in union([(a, b) for a, b, c in vis.get(n, []) if c >= thr], gap) if x[1] - x[0] >= min_len]
+                ov = overlap(d, mk)
+                row[n] = {"draft": round(length(d)), "right": round(ov), "wrong": round(length(d) - ov), "missed": round(length(mk) - ov)}
+            table.append(row)
+    out = {}
+    for thr in thrs:
+        for gap in gaps:
+            out[f"{thr}_{gap}"] = {n: [[round(a, 1), round(b, 1)] for a, b in union([(a, b) for a, b, c in v if c >= thr], gap) if b - a >= min_len]
+                                   for n, v in vis.items()}
+    return {"table": table, "drafts": out}
+
+
 @app.local_entrypoint()
-def main(game_id: str = "2026-09-26", apply: bool = False):
+def main(game_id: str = "2026-09-26", apply: bool = False, mode: str = "carry"):
+    if mode == "drafts":
+        r = drafts.remote(game_id)
+        for row in r["table"]:
+            print("SCORE", json.dumps(row))
+        pathlib.Path(f"/tmp/drafts_{game_id}.json").write_text(json.dumps(r["drafts"]))
+        return
     r = run.remote(game_id, apply)
     print("REPORT", json.dumps(r))
