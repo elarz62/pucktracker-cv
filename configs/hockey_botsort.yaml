@@ -1,13 +1,13 @@
-# BoT-SORT tuned for LiveBarn auto-pan rink footage.
+# BoT-SORT with camera-motion compensation and appearance matching (test 2026-10-01).
 tracker_type: botsort
 track_high_thresh: 0.25
-track_low_thresh: 0.1
-new_track_thresh: 0.3
-track_buffer: 96        # keep lost tracks 4 s at 24 fps (occlusions, brief off-frame)
-match_thresh: 0.8
+track_low_thresh: 0.05
+new_track_thresh: 0.4
+track_buffer: 240
+match_thresh: 0.9
 fuse_score: True
-gmc_method: sparseOptFlow  # compensates for the camera pan
+gmc_method: sparseOptFlow
 proximity_thresh: 0.5
-appearance_thresh: 0.7
+appearance_thresh: 0.25
 with_reid: True
 model: auto
