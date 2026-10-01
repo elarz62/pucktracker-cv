@@ -271,7 +271,7 @@ def drafts(game_id: str, thrs: list = (1.0, 0.7, 0.5, 0.3), gaps: list = (10, 20
                 continue
             elif k in known and known[k][1] == "a":
                 firm.append((k, known[k][0], fr))
-            elif k in guesses:
+            elif k in guesses and guesses[k][0] != "x":
                 cands.append((guesses[k][1], k, guesses[k][0], fr))
         # One kid can't be in two places: a guess loses to a tag or read of the same number at the same
         # time, and to a more confident guess.

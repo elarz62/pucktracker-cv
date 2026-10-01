@@ -52,7 +52,8 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
     tr = tr[(tr.frame >= p["start"] * fps) & (tr.frame < p["end"] * fps)]
     tagged = {int(k.split(":")[1]) for k in tags_for(game_id) if k.startswith(f"{part}:")} if src == "out" else set()
     n = tr.groupby("track_id").size()
-    keep = [t for t in n.index if t in tagged or (teams.get(t) in ("white", "unknown") and n[t] >= 12)]
+    keep = [t for t in n.index if t in tagged or (teams.get(t) in ("white", "unknown") and n[t] >= 12)
+            or (teams.get(t) == "blue" and n[t] >= 24)]
     tr = tr[tr.track_id.isin(keep)]
     want = {}
     for t, g in tr.groupby("track_id"):
@@ -62,7 +63,7 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
     frames = sorted(want)
     cap.set(cv2.CAP_PROP_POS_FRAMES, frames[0])
     f = frames[0]
-    ids, ims, hs = [], [], []
+    ids, ims, hs, tm = [], [], [], []
     for target in frames:
         while f < target:
             cap.grab(); f += 1
@@ -75,21 +76,33 @@ def crops(game_id: str, part: int, src: str = "out") -> dict:
             a, b = max(0, int(x1 - px)), max(0, int(y1 - py))
             c = im[b:int(y2 + py), a:int(x2 + px)]
             if c.size and c.shape[0] >= 16 and c.shape[1] >= 8:
-                ids.append(f"{part}:{t}"); hs.append(int(y2 - y1))
+                ids.append(f"{part}:{t}"); hs.append(int(y2 - y1)); tm.append(str(teams.get(t, "unknown")))
                 ims.append(cv2.cvtColor(cv2.resize(c, (W, H), interpolation=cv2.INTER_CUBIC), cv2.COLOR_BGR2RGB))
-    np.savez(game_dir(game_id) / f"reid_crops_{src}_{part}.npz", ids=np.array(ids), ims=np.stack(ims), hs=np.array(hs))
+    np.savez(game_dir(game_id) / f"reid_crops_{src}_{part}.npz", ids=np.array(ids), ims=np.stack(ims), hs=np.array(hs), teams=np.array(tm))
     vol.commit()
     return {"part": part, "tracks": len(set(ids)), "crops": len(ids)}
 
 
-def load(game_id, src="out"):
+def load(game_id, src="out", with_teams=False):
     import numpy as np
-    ids, ims = [], []
+    ids, ims, tm = [], [], []
     n = len(json.loads((game_dir(game_id) / "game.json").read_text())["parts"])
     for part in range(n):
         z = np.load(game_dir(game_id) / f"reid_crops_{src}_{part}.npz")
         ids += list(z["ids"]); ims.append(z["ims"])
+        tm += list(z["teams"]) if "teams" in z else ["unknown"] * len(z["ids"])
+    if with_teams:
+        return np.array(ids), np.concatenate(ims), np.array(tm)
     return np.array(ids), np.concatenate(ims)
+
+
+def all_tags(game_id):
+    f = game_dir(game_id) / "tags.json"
+    return json.loads(f.read_text()) if f.exists() else {}
+
+
+def class_key(c):
+    return (c == "x", int(c) if c != "x" else 0)
 
 
 def backbone():
@@ -291,9 +304,11 @@ def predict(game_id: str, model_game: str) -> dict:
 
 
 @app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=8, memory=65536, timeout=4 * 60 * 60)
-def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5) -> dict:
-    """New game: train on model_game's tags plus this game's sure jersey reads (v2/known.json) and any tags here.
-    First a check (half the read tracks held out), then the final model on everything; writes guesses.json."""
+def adapt(game_id: str, model_game: str, epochs: int = 4, roster: list = None, max_neg: int = 800) -> dict:
+    """New game: train on model_game's tags plus this game's tags and sure jersey reads (v2/known.json).
+    Class "x" (not one of ours) learns from boxes tagged x and from opponent-colored tracks, so a stranger
+    is not forced onto a roster number. Only roster numbers (and x) can be guessed here.
+    First a check (half this game's labeled tracks held out), then the final model; writes guesses.json."""
     import numpy as np
     import torch
 
@@ -301,6 +316,7 @@ def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5)
     dev = "cuda"
     mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+    rng = np.random.default_rng(1)
 
     def prep(x):
         x = torch.from_numpy(x).to(dev).permute(0, 3, 1, 2).float() / 255
@@ -313,37 +329,58 @@ def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5)
                 P.append(torch.softmax(head(m(prep(X[k:k + 256]))).float(), 1).cpu())
         return torch.cat(P).numpy()
 
-    src_tags = tags_for(model_game)
-    ids_a, ims_a = load(model_game)
-    lab_a = np.array([src_tags.get(t, "") for t in ids_a])
+    def labels(gid, extra):
+        t = {k: v for k, v in all_tags(gid).items() if (v.isdigit() and v != "10") or v == "x"}
+        for k, v in extra.items():
+            t.setdefault(k, v)
+        ids, ims, tm = load(gid, with_teams=True)
+        lab = np.array([t.get(i, "") for i in ids], dtype=object)
+        # opponents: a capped random sample of blue-team tracks the parent didn't tag
+        opp = sorted(set(ids[(tm == "blue") & (lab == "")]))
+        for i in rng.choice(opp, min(max_neg, len(opp)), replace=False) if opp else []:
+            lab[ids == i] = "x"
+        return ids, ims, tm, lab
+
+    reads = {k: v[0] for k, v in json.loads((game_dir(game_id) / "v2" / "known.json").read_text()).items()
+             if v[1] == "a" and v[0] != "10"} if (game_dir(game_id) / "v2" / "known.json").exists() else {}
+    ids_a, ims_a, _, lab_a = labels(model_game, {})
     keep = lab_a != ""
     ids_a, ims_a, lab_a = ids_a[keep], ims_a[keep], lab_a[keep]
-    here = {k: v[0] for k, v in json.loads((game_dir(game_id) / "v2" / "known.json").read_text()).items() if v[1] == "a" and v[0] != "10"}
-    here.update(tags_for(game_id))
-    ids_b, ims_b = load(game_id)
-    lab_b = np.array([here.get(t, "") for t in ids_b])
-    classes = sorted(set(lab_a) | set(x for x in lab_b if x), key=int)
+    ids_b, ims_b, tm_b, lab_b = labels(game_id, reads)
+    classes = sorted(set(lab_a) | set(x for x in lab_b if x), key=class_key)
     ci = {c: k for k, c in enumerate(classes)}
-    labeled_tracks = sorted(set(ids_b[lab_b != ""]))
-    rng = np.random.default_rng(1)
-    held = set(rng.choice(labeled_tracks, len(labeled_tracks) // 2, replace=False))
-    res = {"source_tracks": int(len(set(ids_a))), "labeled_here": len(labeled_tracks)}
+    allowed = np.array([c == "x" or roster is None or c in roster for c in classes])
+    ours_b = sorted(set(ids_b[(lab_b != "") & (lab_b != "x")]))
+    held = set(rng.choice(ours_b, len(ours_b) // 2, replace=False))
+    res = {"classes": classes, "source_tracks": int(len(set(ids_a))), "labeled_here": int(len(set(ids_b[lab_b != ""]))),
+           "ours_labeled_here": len(ours_b)}
 
-    # check: hold out half of this game's labeled tracks
+    def scores(P, ids):
+        P = P * allowed
+        P = P / P.sum(1, keepdims=True)
+        return track_scores(ids, P)
+
+    # check: hold out half of this game's labeled kids
     tr_b = (lab_b != "") & np.array([t not in held for t in ids_b])
     te_b = np.array([t in held for t in ids_b])
     X = np.concatenate([ims_a, ims_b[tr_b]]); y = [ci[c] for c in lab_a] + [ci[c] for c in lab_b[tr_b]]
     m = backbone().to(dev)
     head = finetune(m, X, y, len(classes), epochs, prep)
-    P = predict(m, head, ims_b[te_b])
-    ts = track_scores(ids_b[te_b], P)
-    truth = {t: here[t] for t in ts}
+    ts = scores(predict(m, head, ims_b[te_b]), ids_b[te_b])
+    truth = {t: lab_b[ids_b == t][0] for t in ts}
     top = {t: classes[int(p.argmax())] for t, p in ts.items()}
     conf = {t: float(p.max()) for t, p in ts.items()}
-    res["check"] = {"tracks": len(ts), "top1": round(float(np.mean([top[t] == truth[t] for t in ts])), 3)}
+    res["check"] = {"tracks": len(ts), "top1": round(float(np.mean([top[t] == truth[t] for t in ts])), 3),
+                    "called_not_ours": round(float(np.mean([top[t] == "x" for t in ts])), 3)}
     for th in (0.3, 0.5, 0.7):
-        sel = [t for t in ts if conf[t] >= th]
+        sel = [t for t in ts if conf[t] >= th and top[t] != "x"]
         res["check"][f"conf>={th}"] = [round(len(sel) / len(ts), 2), round(float(np.mean([top[t] == truth[t] for t in sel])), 3) if sel else None]
+    # how often an opponent sample (not trained on) gets a roster number: use blue tracks left out of training
+    opp_left = sorted(set(ids_b[(tm_b == "blue") & (lab_b == "")]))[:400]
+    if opp_left:
+        mk = np.isin(ids_b, opp_left)
+        to = scores(predict(m, head, ims_b[mk]), ids_b[mk])
+        res["check"]["opponents_given_a_number_at_0.5"] = round(float(np.mean([classes[int(p.argmax())] != "x" and p.max() >= 0.5 for p in to.values()])), 3)
     del m, head
     torch.cuda.empty_cache()
 
@@ -353,9 +390,8 @@ def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5)
     m = backbone().to(dev)
     head = finetune(m, X, y, len(classes), epochs, prep)
     rest = ~tr_b
-    P = predict(m, head, ims_b[rest])
     out = {}
-    for t, p in track_scores(ids_b[rest], P).items():
+    for t, p in scores(predict(m, head, ims_b[rest]), ids_b[rest]).items():
         j = int(p.argmax())
         out[str(t)] = [classes[j], round(float(p[j]), 3)]
     (game_dir(game_id) / "guesses.json").write_text(json.dumps(out, separators=(",", ":")))
@@ -363,9 +399,9 @@ def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5)
                 "norm": m.norm.state_dict(), "games": [model_game, game_id]}, game_dir(game_id) / "reid_model.pt")
     vol.commit()
     res["guessed"] = len(out)
-    res["conf>=0.5"] = sum(1 for v in out.values() if v[1] >= 0.5)
+    res["guessed_not_ours"] = sum(1 for v in out.values() if v[0] == "x")
+    res["ours_conf>=0.5"] = sum(1 for v in out.values() if v[1] >= 0.5 and v[0] != "x")
     return res
-
 
 @app.local_entrypoint()
 def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8, mode: str = "test",
@@ -374,8 +410,11 @@ def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8,
         n = len(json.load(open(f"games/{game_id}.json"))["parts"])
         for r in crops.starmap([(game_id, k) for k in range(n)]):
             print("CROPS", r, flush=True)
+    if mode == "crops":
+        return
     if mode == "adapt":
-        print("ADAPT", json.dumps(adapt.remote(game_id, model_game, epochs)), flush=True)
+        g = json.load(open(f"games/{game_id}.json"))
+        print("ADAPT", json.dumps(adapt.remote(game_id, model_game, epochs, g.get("roster"))), flush=True)
         return
     if mode == "predict":
         print("PREDICT", json.dumps(predict.remote(game_id, model_game)), flush=True)
