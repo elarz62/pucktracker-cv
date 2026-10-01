@@ -308,8 +308,9 @@ def web():
         check(req)
         body = await req.json()
         track, number = str(body.get("track", "")), body.get("number")
-        # A number tags a player; "x" marks the box as not a player (a referee, a coach, a misread).
-        if game_id not in game_ids() or not track or (number is not None and number != "x" and not str(number).isdigit()):
+        # A number tags a player; "x" marks the box as not a player (a referee, a coach, a misread);
+        # "?" means one of ours but not sure who, which clears the tracker's guess without naming anyone.
+        if game_id not in game_ids() or not track or (number is not None and number not in ("x", "?") and not str(number).isdigit()):
             raise HTTPException(400)
         tags = read_tags(game_id)
         if number is None:

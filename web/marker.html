@@ -96,6 +96,12 @@ a.btn { text-decoration: none }
 .save { font-size: 12px; color: var(--muted) }
 .save.err { color: var(--red) }
 .videobox canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none }
+.boxmenu { position: absolute; z-index: 3; background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px; display: grid; gap: 6px; max-width: 260px; box-shadow: 0 6px 24px rgba(0,0,0,.35); font-size: 13px }
+.boxmenu .nums { display: flex; flex-wrap: wrap; gap: 4px }
+.boxmenu button { padding: 6px 8px; font-size: 13px }
+.boxmenu .nums button { font: 700 15px/1 var(--display); min-width: 38px; justify-content: center }
+.boxmenu .nums button.cur { background: var(--red); border-color: var(--red); color: #fff }
 .videobox.tagging canvas { pointer-events: auto; cursor: crosshair }
 button.tagon { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600 }
 .lane.tags .seg { background: var(--good) }
@@ -127,7 +133,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
   </section>
 
   <section class="panel">
-    <div class="videobox" id="vbox"><video id="vid" playsinline preload="metadata"></video><canvas id="boxes"></canvas></div>
+    <div class="videobox" id="vbox"><video id="vid" playsinline preload="metadata"></video><canvas id="boxes"></canvas><div class="boxmenu" id="boxmenu" hidden></div></div>
 
     <div class="controls">
       <button id="play" title="Play or pause (Space)">Play <kbd>Space</kbd></button>
@@ -147,7 +153,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       <div class="lane ref" id="refLane"><span class="name">LiveBarn</span><div class="track" data-lane="ref"></div></div>
     </div>
     <div class="ticks"><i></i><div id="ticks"></div></div>
-    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing). Right-click or Shift-click a box to mark it as not a player (a referee, or a wrong guess); do it again to undo.</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
+    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing). Right-click a box for a menu: pick any number, mark one of ours but not sure who, mark not a player, or clear. Shift-click is a shortcut for not a player.</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
   </section>
 
   <div class="grid2">
@@ -411,6 +417,8 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     frameAt(vid.currentTime).forEach(([id, x, y, w, h, team]) => {
       if (REFS.has(id) && !tags[id]) return;   // striped referee shirt
       const bx = { id, x: r.x + x * r.w, y: r.y + y * r.h, w: w * r.w, h: h * r.h }; shown.push(bx);
+      if (tags[id] === '?') { ctx.lineWidth = 1.5; ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.strokeRect(bx.x, bx.y, bx.w, bx.h);
+        ctx.font = '600 13px ' + css.getPropertyValue('--mono'); ctx.fillStyle = 'rgba(90,100,120,.9)'; ctx.fillRect(bx.x, bx.y - 17, 16, 16); ctx.fillStyle = '#fff'; ctx.fillText('?', bx.x + 4, bx.y - 4); return; }
       if (tags[id] === 'x') { ctx.setLineDash([2, 4]); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.strokeRect(bx.x, bx.y, bx.w, bx.h); ctx.setLineDash([]); return; }
       // Your tag wins; otherwise show what the number reader saw (sure, or a guess with "?").
       const tg = tags[id], kn = !tg && G.known && G.known[id], n = tg || (kn && kn[0]), mine = n === num;
@@ -423,26 +431,45 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     });
   }
   function setTagging(on) {
-    tagging = on; $('vbox').classList.toggle('tagging', on); $('tagBtn').classList.toggle('tagon', on);
+    tagging = on; if (!on) closeMenu(); $('vbox').classList.toggle('tagging', on); $('tagBtn').classList.toggle('tagon', on);
     if (on) vid.pause(); drawBoxes();
   }
   $('tagBtn').onclick = () => setTagging(!tagging);
-  cv.addEventListener('contextmenu', e => { if (tagging) { e.preventDefault(); onBoxClick(e); } });
-  cv.addEventListener('click', e => onBoxClick(e));
-  async function onBoxClick(e) {
+  // Left-click: tag as the selected player (again to untag). Shift-click: not a player.
+  // Right-click: a menu to pick any number, mark one of ours but unsure, mark not a player, or clear.
+  function hitAt(e) {
     const rc = cv.getBoundingClientRect(), px = e.clientX - rc.left, py = e.clientY - rc.top;
-    const hit = shown.filter(b => px >= b.x - 4 && px <= b.x + b.w + 4 && py >= b.y - 4 && py <= b.y + b.h + 4).sort((a, b) => a.w * a.h - b.w * b.h)[0];
-    if (!hit) { if (e.type === 'click') vid.paused ? vid.play() : vid.pause(); return; }
-    // Shift-click (or right-click) marks a box as not a player; doing it again clears that.
-    const notPlayer = e.shiftKey || e.type === 'contextmenu';
-    const before = tags[hit.id], next = notPlayer ? (before === 'x' ? null : 'x') : (before === num ? null : num);
-    if (next) tags[hit.id] = next; else delete tags[hit.id];
+    return { px, py, hit: shown.filter(b => px >= b.x - 4 && px <= b.x + b.w + 4 && py >= b.y - 4 && py <= b.y + b.h + 4).sort((a, b) => a.w * a.h - b.w * b.h)[0] };
+  }
+  cv.addEventListener('click', e => {
+    if (!$('boxmenu').hidden) return closeMenu();
+    const { hit } = hitAt(e);
+    if (!hit) { vid.paused ? vid.play() : vid.pause(); return; }
+    const before = tags[hit.id];
+    setTag(hit.id, e.shiftKey ? (before === 'x' ? null : 'x') : (before === num ? null : num));
+  });
+  cv.addEventListener('contextmenu', e => {
+    if (!tagging) return; e.preventDefault();
+    const { px, py, hit } = hitAt(e); if (!hit) return closeMenu();
+    const m = $('boxmenu'), cur = tags[hit.id];
+    m.innerHTML = `<div class="note">Who is this?</div><div class="nums">${roster.map(n => `<button data-v="${n}" class="${cur === n ? 'cur' : ''}">#${n}</button>`).join('')}</div>
+      <button data-v="?">One of ours, not sure who</button><button data-v="x">Not a player</button>${cur ? '<button data-v="">Clear my tag</button>' : ''}`;
+    m.hidden = false; m.dataset.id = hit.id;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    m.style.left = Math.min(px + 8, W - m.offsetWidth - 4) + 'px'; m.style.top = Math.max(4, Math.min(py - 20, H - m.offsetHeight - 4)) + 'px';
+  });
+  $('boxmenu').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; const id = $('boxmenu').dataset.id; closeMenu(); setTag(id, b.dataset.v || null); });
+  function closeMenu() { $('boxmenu').hidden = true; }
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenu(); });
+  async function setTag(id, next) {
+    const before = tags[id];
+    if (next) tags[id] = next; else delete tags[id];
     if (!reviewed(num) && !shifts.some(s => s.src === 'mine')) shifts = draft(num);
     drawBoxes(); render(); setSave('Saving tag…');
     try {
-      const r = await fetch(`/api/games/${gameId}/tags`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track: hit.id, number: next }) });
+      const r = await fetch(`/api/games/${gameId}/tags`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ track: id, number: next }) });
       if (!r.ok) throw new Error(r.status); setSave('Tag saved');
-    } catch (err) { if (before) tags[hit.id] = before; else delete tags[hit.id]; drawBoxes(); render(); setSave('Tag not saved. Check your connection and try again.', true); }
+    } catch (err) { if (before) tags[id] = before; else delete tags[id]; drawBoxes(); render(); setSave('Tag not saved. Check your connection and try again.', true); }
   }
   window.addEventListener('resize', drawBoxes);
   vid.addEventListener('seeked', drawBoxes);
