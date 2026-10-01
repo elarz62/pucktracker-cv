@@ -153,7 +153,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       <div class="lane ref" id="refLane"><span class="name">LiveBarn</span><div class="track" data-lane="ref"></div></div>
     </div>
     <div class="ticks"><i></i><div id="ticks"></div></div>
-    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing). Right-click a box for a menu: pick any number, mark one of ours but not sure who, mark not a player, or clear. Shift-click is a shortcut for not a player.</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
+    <div class="keys"><span><kbd>M</kbd> toggle on/off at the playhead</span><span><kbd>Space</kbd> play/pause</span><span><kbd>←</kbd><kbd>→</kbd> 5 s</span><span><kbd>S</kbd> speed</span><span>Click any lane to jump</span><span><kbd>T</kbd> tag players: pause, then click a white jersey to tag it as the selected player; click again to untag. Red and green labels are tags; blue labels are numbers the tracker read (a ? means it is guessing). Right-click a box for a menu: pick any number, mark one of ours but not sure who, mark not one of ours, or clear. Shift-click is a shortcut for not one of ours.</span><span>Thin lines mark where one LiveBarn file ends and the next begins</span></div>
   </section>
 
   <div class="grid2">
@@ -453,7 +453,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     const { px, py, hit } = hitAt(e); if (!hit) return closeMenu();
     const m = $('boxmenu'), cur = tags[hit.id];
     m.innerHTML = `<div class="note">Who is this?</div><div class="nums">${roster.map(n => `<button data-v="${n}" class="${cur === n ? 'cur' : ''}">#${n}</button>`).join('')}</div>
-      <button data-v="?">One of ours, not sure who</button><button data-v="x">Not a player</button>${cur ? '<button data-v="">Clear my tag</button>' : ''}`;
+      <button data-v="?">One of ours, not sure who</button><button data-v="x">Not one of ours (other team, ref)</button>${cur ? '<button data-v="">Clear my tag</button>' : ''}`;
     m.hidden = false; m.dataset.id = hit.id;
     const W = cv.clientWidth, H = cv.clientHeight;
     m.style.left = Math.min(px + 8, W - m.offsetWidth - 4) + 'px'; m.style.top = Math.max(4, Math.min(py - 20, H - m.offsetHeight - 4)) + 'px';
