@@ -157,3 +157,58 @@ def guess(game_id: str) -> dict:
     (game_dir(game_id) / "guesses.json").write_text(json.dumps(out, separators=(",", ":")))
     vol.commit()
     return {"guessed": len(out), "labels": len(tr)}
+
+
+def stripe_score(crop):
+    """Referee shirts alternate black and white across the chest.
+    Returns (median light/dark flips per torso row, dark share, row agreement)."""
+    import cv2
+    import numpy as np
+    h, w = crop.shape[:2]
+    torso = crop[int(h * 0.15):int(h * 0.5), int(w * 0.1):int(w * 0.9)]
+    if torso.size == 0 or torso.shape[1] < 10:
+        return None
+    g = cv2.cvtColor(cv2.resize(torso, (64, 24), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    _, b = cv2.threshold(g, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    flips = np.abs(np.diff(b.astype(int), axis=1)).sum(1)
+    # stripes are vertical: columns agree from row to row
+    agree = float((b[1:] == b[:-1]).mean())
+    return float(np.median(flips)), float(1 - b.mean()), agree
+
+
+@app.function(image=image, volumes={str(DATA): vol}, cpu=8, memory=16384, timeout=3 * 60 * 60)
+def find_refs(game_id: str, per_track: int = 8) -> dict:
+    """Score every track for referee stripes; writes refs.json {track: [flips, dark, light]}."""
+    import cv2
+    import numpy as np
+    import pandas as pd
+    game = load_game(game_id)
+    out = {}
+    for i, p in enumerate(game["parts"]):
+        stem = pathlib.Path(p["file"]).stem
+        tr = pd.read_csv(DATA / "out" / stem / "tracks.csv")
+        cap = cv2.VideoCapture(str(DATA / "videos" / p["file"]))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24
+        tr = tr[(tr.frame >= p["start"] * fps) & (tr.frame < p["end"] * fps) & ((tr.y2 - tr.y1) >= 40)]
+        want = {}
+        for t, g in tr.groupby("track_id"):
+            for r in g.iloc[np.linspace(0, len(g) - 1, min(per_track, len(g))).astype(int)].itertuples():
+                want.setdefault(int(r.frame), []).append((t, r.x1, r.y1, r.x2, r.y2))
+        scores = {}
+        frames = sorted(want); cap.set(cv2.CAP_PROP_POS_FRAMES, frames[0]); f = frames[0]
+        for target in frames:
+            while f < target:
+                cap.grab(); f += 1
+            ok, im = cap.read(); f += 1
+            if not ok:
+                break
+            for t, x1, y1, x2, y2 in want[target]:
+                s = stripe_score(im[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)])
+                if s:
+                    scores.setdefault(t, []).append(s)
+        for t, s in scores.items():
+            out[f"{i}:{t}"] = [round(float(v), 3) for v in np.median(np.array(s), axis=0)]
+        print(f"part {i}: {len(scores)} tracks", flush=True)
+    (game_dir(game_id) / "refs.json").write_text(json.dumps(out, separators=(",", ":")))
+    vol.commit()
+    return {"tracks": len(out)}

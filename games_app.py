@@ -271,8 +271,16 @@ def web():
                 "duration": g.get("duration") or x.get("duration"), "parts": g["parts"],
                 "offsets": g.get("offsets") or offsets(g), "drafts": x.get("drafts", {}), "ref": x.get("ref", {}),
                 "ref_note": x.get("ref_note", {}), "roster": g.get("roster") or x.get("roster") or sorted(x.get("drafts", {}), key=int),
-                "marks": marks, "player_videos": players, "tags": read_tags(game_id), "known": x.get("known", {}),
+                "marks": marks, "player_videos": players, "tags": read_tags(game_id), "known": x.get("known", {}), "refs": read_refs(game_id),
                 "has_boxes": (game_dir(game_id) / "boxes" / "tracks.json").exists()}
+
+    def read_refs(game_id: str) -> list:
+        """Tracks with a referee's black-and-white stripes (reid_app.find_refs). At 10+ flips per row
+        no parent-tagged player was caught in the Sep 26 game; far-away refs score lower and stay boxed."""
+        p = game_dir(game_id) / "refs.json"
+        if not p.exists():
+            return []
+        return [k for k, (flips, dark, _) in json.loads(p.read_text()).items() if flips >= 10 and 0.25 <= dark <= 0.75]
 
     def read_tags(game_id: str) -> dict:
         p = game_dir(game_id) / "tags.json"

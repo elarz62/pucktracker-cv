@@ -210,7 +210,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
 
   let G = null, gameId = null, dur = 3600, num = '21', roster = [], shifts = [], openIdx = -1;
   let marks = {};   // number -> shifts (server copy, updated as you mark)
-  let tags = {}, TR = {}, boxCache = {}, tagging = false;
+  let tags = {}, TR = {}, boxCache = {}, tagging = false, REFS = new Set();
   // Tracker draft plus every stretch where you tagged this player, joined when gaps are under 20 s.
   function draftSpans(n) {
     const iv = (G.drafts[n] || []).map(x => x.slice());
@@ -372,7 +372,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
       try { const v = JSON.parse(loc); if (JSON.stringify(v) !== JSON.stringify(marks[n] || null) && !G.marks[n]) { marks[n] = v; pending[n] = true; } } catch (e) {}
     });
     if (Object.keys(pending).length) flush();
-    tags = G.tags || {}; TR = {}; boxCache = {};
+    tags = G.tags || {}; TR = {}; boxCache = {}; REFS = new Set(G.refs || []);
     if (G.has_boxes) fetch(`/api/games/${id}/tracks`).then(r => r.ok ? r.json() : {}).then(j => { TR = j; if (!marks[num]) shifts = listFor(num).map(s => ({ ...s })); render(); });
     $('tagBtn').hidden = !G.has_boxes;
     roster = G.roster.slice();
@@ -409,6 +409,7 @@ tr.cur td { background: color-mix(in srgb, var(--red) 8%, transparent) }
     if (!tagging || !G) return;
     const css = getComputedStyle(document.documentElement);
     frameAt(vid.currentTime).forEach(([id, x, y, w, h, team]) => {
+      if (REFS.has(id) && !tags[id]) return;   // striped referee shirt
       const bx = { id, x: r.x + x * r.w, y: r.y + y * r.h, w: w * r.w, h: h * r.h }; shown.push(bx);
       if (tags[id] === 'x') { ctx.setLineDash([2, 4]); ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(255,255,255,.3)'; ctx.strokeRect(bx.x, bx.y, bx.w, bx.h); ctx.setLineDash([]); return; }
       // Your tag wins; otherwise show what the number reader saw (sure, or a guess with "?").
