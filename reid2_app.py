@@ -290,6 +290,83 @@ def predict(game_id: str, model_game: str) -> dict:
     return {"guessed": len(out), "conf>=0.5": sum(1 for v in out.values() if v[1] >= 0.5)}
 
 
+@app.function(image=image, gpu="L4", volumes={str(DATA): vol}, cpu=8, memory=65536, timeout=4 * 60 * 60)
+def adapt(game_id: str, model_game: str, epochs: int = 4, min_conf: float = 0.5) -> dict:
+    """New game: train on model_game's tags plus this game's sure jersey reads (v2/known.json) and any tags here.
+    First a check (half the read tracks held out), then the final model on everything; writes guesses.json."""
+    import numpy as np
+    import torch
+
+    vol.reload()
+    dev = "cuda"
+    mean = torch.tensor([0.485, 0.456, 0.406], device=dev).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=dev).view(1, 3, 1, 1)
+
+    def prep(x):
+        x = torch.from_numpy(x).to(dev).permute(0, 3, 1, 2).float() / 255
+        return (x - mean) / std
+
+    def predict(m, head, X):
+        P = []
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            for k in range(0, len(X), 256):
+                P.append(torch.softmax(head(m(prep(X[k:k + 256]))).float(), 1).cpu())
+        return torch.cat(P).numpy()
+
+    src_tags = tags_for(model_game)
+    ids_a, ims_a = load(model_game)
+    lab_a = np.array([src_tags.get(t, "") for t in ids_a])
+    keep = lab_a != ""
+    ids_a, ims_a, lab_a = ids_a[keep], ims_a[keep], lab_a[keep]
+    here = {k: v[0] for k, v in json.loads((game_dir(game_id) / "v2" / "known.json").read_text()).items() if v[1] == "a" and v[0] != "10"}
+    here.update(tags_for(game_id))
+    ids_b, ims_b = load(game_id)
+    lab_b = np.array([here.get(t, "") for t in ids_b])
+    classes = sorted(set(lab_a) | set(x for x in lab_b if x), key=int)
+    ci = {c: k for k, c in enumerate(classes)}
+    labeled_tracks = sorted(set(ids_b[lab_b != ""]))
+    rng = np.random.default_rng(1)
+    held = set(rng.choice(labeled_tracks, len(labeled_tracks) // 2, replace=False))
+    res = {"source_tracks": int(len(set(ids_a))), "labeled_here": len(labeled_tracks)}
+
+    # check: hold out half of this game's labeled tracks
+    tr_b = (lab_b != "") & np.array([t not in held for t in ids_b])
+    te_b = np.array([t in held for t in ids_b])
+    X = np.concatenate([ims_a, ims_b[tr_b]]); y = [ci[c] for c in lab_a] + [ci[c] for c in lab_b[tr_b]]
+    m = backbone().to(dev)
+    head = finetune(m, X, y, len(classes), epochs, prep)
+    P = predict(m, head, ims_b[te_b])
+    ts = track_scores(ids_b[te_b], P)
+    truth = {t: here[t] for t in ts}
+    top = {t: classes[int(p.argmax())] for t, p in ts.items()}
+    conf = {t: float(p.max()) for t, p in ts.items()}
+    res["check"] = {"tracks": len(ts), "top1": round(float(np.mean([top[t] == truth[t] for t in ts])), 3)}
+    for th in (0.3, 0.5, 0.7):
+        sel = [t for t in ts if conf[t] >= th]
+        res["check"][f"conf>={th}"] = [round(len(sel) / len(ts), 2), round(float(np.mean([top[t] == truth[t] for t in sel])), 3) if sel else None]
+    del m, head
+    torch.cuda.empty_cache()
+
+    # final: everything labeled, guess the rest of this game
+    tr_b = lab_b != ""
+    X = np.concatenate([ims_a, ims_b[tr_b]]); y = [ci[c] for c in lab_a] + [ci[c] for c in lab_b[tr_b]]
+    m = backbone().to(dev)
+    head = finetune(m, X, y, len(classes), epochs, prep)
+    rest = ~tr_b
+    P = predict(m, head, ims_b[rest])
+    out = {}
+    for t, p in track_scores(ids_b[rest], P).items():
+        j = int(p.argmax())
+        out[str(t)] = [classes[j], round(float(p[j]), 3)]
+    (game_dir(game_id) / "guesses.json").write_text(json.dumps(out, separators=(",", ":")))
+    torch.save({"classes": classes, "head": head.state_dict(), "blocks": [b.state_dict() for b in m.blocks[-4:]],
+                "norm": m.norm.state_dict(), "games": [model_game, game_id]}, game_dir(game_id) / "reid_model.pt")
+    vol.commit()
+    res["guessed"] = len(out)
+    res["conf>=0.5"] = sum(1 for v in out.values() if v[1] >= 0.5)
+    return res
+
+
 @app.local_entrypoint()
 def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8, mode: str = "test",
          model_game: str = "2026-09-26"):
@@ -297,6 +374,9 @@ def main(game_id: str = "2026-09-26", skip_crops: bool = False, epochs: int = 8,
         n = len(json.load(open(f"games/{game_id}.json"))["parts"])
         for r in crops.starmap([(game_id, k) for k in range(n)]):
             print("CROPS", r, flush=True)
+    if mode == "adapt":
+        print("ADAPT", json.dumps(adapt.remote(game_id, model_game, epochs)), flush=True)
+        return
     if mode == "predict":
         print("PREDICT", json.dumps(predict.remote(game_id, model_game)), flush=True)
         return
