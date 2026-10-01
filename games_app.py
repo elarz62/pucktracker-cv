@@ -98,7 +98,8 @@ def make_boxes(game_id: str, fps_out: int = 6, lags: list = None) -> dict:
     """Put the tracker's player boxes on the master timeline so people can click players in the video.
 
     lags: seconds each part's boxes trail the master video (measured by matching fresh detections on the
-    master against the tracker's boxes; the Sep 26 files measured 0.1, 0.25 and 0.4).
+    master, decoded with ffmpeg the way a browser plays it, against the tracker's boxes; the Sep 26
+    files measured 0.2, 0.45 and 0.7, steady across each file. OpenCV seeking reads them about 0.1 to 0.3 s short).
     Writes boxes/<minute>.json ({time: [[track, x, y, w, h, team], ...]}, coordinates 0 to 1)
     and boxes/tracks.json ({track: [start, end, team]}). Track ids are "<part>:<tracker id>".
     """
