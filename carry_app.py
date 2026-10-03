@@ -250,7 +250,8 @@ def drafts(game_id: str, thrs: list = (1.0, 0.7, 0.5, 0.3), gaps: list = (10, 20
     g = DATA / "games" / game_id
     game = json.loads((g / "game.json").read_text())
     tags = json.loads((g / "tags.json").read_text()) if (g / "tags.json").exists() else {}
-    known = json.loads((g / "v2" / "known.json").read_text()) if (g / "v2" / "known.json").exists() else {}
+    kf = g / "untangle" / "known.json" if (g / "untangle" / "known.json").exists() else g / "v2" / "known.json"
+    known = json.loads(kf.read_text()) if kf.exists() else {}
     guesses = json.loads((g / "guesses.json").read_text()) if (g / "guesses.json").exists() else {}
     marks = {p.stem: [[s["on"], s["off"]] for s in json.loads(p.read_text())["shifts"] if s.get("off") is not None]
              for p in (g / "marks").glob("*.json")}
