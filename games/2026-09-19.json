@@ -1,0 +1,43 @@
+{
+  "id": "2026-09-19",
+  "title": "Sep 19 game",
+  "rink": "Breakaway Ice Center Rink 1",
+  "team_color": "white",
+  "parts": [
+    {
+      "file": "Breakaway_Ice_Center_Rink_1_2026-09-19T090001.mp4",
+      "start": 1500,
+      "end": 1800
+    },
+    {
+      "file": "Breakaway_Ice_Center_Rink_1_2026-09-19T093001.mp4",
+      "start": 0,
+      "end": 1800
+    },
+    {
+      "file": "Breakaway_Ice_Center_Rink_1_2026-09-19T100001.mp4",
+      "start": 0,
+      "end": 990
+    }
+  ],
+  "box_lags": [
+    0.075,
+    0.18,
+    0.26
+  ],
+  "roster": [
+    "1",
+    "2",
+    "4",
+    "7",
+    "9",
+    "12",
+    "18",
+    "21",
+    "24",
+    "26",
+    "27",
+    "29",
+    "98"
+  ]
+}

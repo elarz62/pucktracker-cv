@@ -1,0 +1,24 @@
+{
+  "id": "2026-09-26",
+  "title": "Sep 26 game",
+  "rink": "Somerville Veterans Memorial Rink 1",
+  "team_color": "white",
+  "parts": [
+    {
+      "file": "Somerville_Veterans_Memorial_Rink_Rink_1_2026-09-26T135957.mp4",
+      "start": 1230,
+      "end": 1800
+    },
+    {
+      "file": "Somerville_Veterans_Memorial_Rink_Rink_1_2026-09-26T142957.mp4",
+      "start": 0,
+      "end": 1800
+    },
+    {
+      "file": "Somerville_Veterans_Memorial_Rink_Rink_1_2026-09-26T145957.mp4",
+      "start": 0,
+      "end": 1160
+    }
+  ],
+  "box_lags": [0.117, 0.242, 0.367]
+}
