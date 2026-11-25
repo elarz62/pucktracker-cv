@@ -409,13 +409,23 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merg
         ot, oc = old.get(key, ("unknown", 0.0))
         is_b = bl > cfg["blue_frac"] or ot == "blue" or oc > 0.2
         team[key] = "b" if is_b else ("r" if h > cfg["ref_ratio"] * hmed and len(v) >= 3 else "w")
+    # team fixes made by clicking dots on the /rink page (track key "part:tid" -> team)
+    fixp = DATA / "games" / game_id / "rink" / "team_fix.json"
+    fixes = json.loads(fixp.read_text()) if fixp.exists() else {}
+    for k_, v_ in fixes.items():
+        pp, tt = k_.split(":")
+        team[(int(pp), int(tt))] = v_
+    # median rink depth per track (to tell far-boards players from fans in the stands)
+    ymed = {key: float(np.median(np.array(v)[:, 2])) for key, v in feats.items()}
     # project all tracks
     segs = []
     for i, p in enumerate(game["parts"]):
         stem = pathlib.Path(p["file"]).stem
         tr = pd.read_csv(DATA / "out" / stem / "tracks.csv", usecols=["frame", "track_id", "x1", "y1", "x2", "y2"])
         tm = pd.read_csv(DATA / "out" / stem / "teams.csv").set_index("track_id")["team"]
-        tr = tr[tr.track_id.map(tm).fillna("u") != "stands"]
+        st = tr.track_id.map(tm).fillna("u") == "stands"
+        on_ice = tr.track_id.map(lambda t_: ymed.get((i, t_), 99.0) < W - 0.5)
+        tr = tr[~st | on_ice]
         step = max(1, round(fps[i] / 12))
         tr = tr[tr.frame % step == 0]
         tr["t"] = tr.frame / fps[i]
@@ -447,7 +457,9 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merg
                 continue
             X = gq.X.rolling(5, center=True, min_periods=1).median().rolling(5, center=True, min_periods=1).mean().values
             Y = gq.Y.rolling(5, center=True, min_periods=1).median().rolling(5, center=True, min_periods=1).mean().values
-            segs.append({"team": team.get((i, tid), "w"), "t": gq.mt.values, "X": X, "Y": Y})
+            if team.get((i, tid)) == "x":  # marked "not a player" on the page
+                continue
+            segs.append({"team": team.get((i, tid), "w"), "t": gq.mt.values, "X": X, "Y": Y, "key": f"{i}:{tid}"})
     # link short dropouts: a dot that disappears continues if a same-color detection shows up near where it was heading
     segs.sort(key=lambda s: s["t"][0])
     ends = []
@@ -562,6 +574,13 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merg
             count[r[3]] = count.get(r[3], 0) + 1
             out_.append(r)
         frames[q] = out_
+    # which tracks make up each dot (so a team fix on the page can be saved per track)
+    dots_tracks = {}
+    for k, s_ in enumerate(segs):
+        if dot[k] in keep_dot:
+            dots_tracks.setdefault(str(dot[k]), []).append(s_["key"])
+    (out / "dots.json").write_text(json.dumps(dots_tracks))
+    (out / "dot_fix.json").unlink(missing_ok=True)  # page fixes are now baked in through team_fix.json
     # write per-minute files
     bx = np.r_[np.c_[np.linspace(0, 1919, 16), np.full(16, 1079)], np.c_[np.full(6, 1919), np.linspace(1079, 0, 6)],
                np.c_[np.linspace(1919, 0, 16), np.zeros(16)], np.c_[np.zeros(6), np.linspace(0, 1079, 6)]]

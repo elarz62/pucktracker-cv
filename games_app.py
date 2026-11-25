@@ -402,6 +402,33 @@ def web():
         check(req)
         return HTMLResponse((pathlib.Path("/root/web") / "rink.html").read_text())
 
+    @api.post("/api/games/{game_id}/rink/teamfix")
+    async def rink_teamfix(game_id: str, req: Request):
+        """Body {"dot": 12, "team": "b"}: recolor a dot. Saved per dot (applied on the page now) and per
+        underlying track (applied by the next rink build)."""
+        check(req)
+        body = await req.json()
+        dot, team = str(int(body.get("dot"))), body.get("team")
+        if game_id not in game_ids() or team not in ("w", "b", "r", "x"):
+            raise HTTPException(400)
+        rd = game_dir(game_id) / "rink"
+        reload()
+        rj = lambda n: json.loads((rd / n).read_text()) if (rd / n).exists() else {}
+        dotfix, trackfix, dots = rj("dot_fix.json"), rj("team_fix.json"), rj("dots.json")
+        dotfix[dot] = team
+        for k in dots.get(dot, []):
+            trackfix[k] = team
+        (rd / "dot_fix.json").write_text(json.dumps(dotfix))
+        (rd / "team_fix.json").write_text(json.dumps(trackfix))
+        vol.commit()
+        return {"ok": True, "fixed": len(dotfix)}
+
+    @api.get("/api/games/{game_id}/rink/dotfix")
+    def rink_dotfix(game_id: str, req: Request):
+        check(req)
+        p = game_dir(game_id) / "rink" / "dot_fix.json"
+        return JSONResponse(json.loads(p.read_text()) if p.exists() else {}, headers={"Cache-Control": "no-store"})
+
     @api.get("/api/games/{game_id}/rink/{name}")
     def rink_data(game_id: str, name: str, req: Request):
         check(req)

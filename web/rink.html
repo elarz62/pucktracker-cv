@@ -37,6 +37,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .opts{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:14px}
 .opts label{display:flex;gap:6px;align-items:center;cursor:pointer}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);align-items:center}
+.fixmenu{position:absolute;z-index:20;background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.18);padding:6px;display:flex;flex-direction:column;gap:2px;min-width:150px}
+.fixmenu[hidden]{display:none}
+.fixmenu .fm-h{font:600 12px var(--body);color:var(--muted);padding:2px 8px 4px}
+.fixmenu button{font:500 14px var(--body);text-align:left;border:0;background:none;color:var(--fg);padding:6px 8px;border-radius:5px;cursor:pointer}
+.fixmenu button:hover{background:var(--bg)}
 .dot{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;margin-right:4px}
 .tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
 .notes{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 18px;display:grid;gap:8px}
@@ -76,8 +81,11 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       <div class="tools" aria-label="Drawing tools">
         <button class="tool" id="tPen" aria-pressed="false">Pen</button>
         <button class="tool" id="tArrow" aria-pressed="false">Arrow</button>
+        <button class="tool" id="tW" aria-pressed="false">+ White dot</button>
+        <button class="tool" id="tB" aria-pressed="false">+ Blue dot</button>
+        <button class="tool" id="tP" aria-pressed="false">+ Puck</button>
         <button class="tool" id="tClear">Clear drawings</button>
-        <span class="status">Drawing pauses the video. Drawings stay until cleared.</span>
+        <span class="status">Drawing pauses the video. Drag a placed dot to move it, right-click to remove it. Click a tracked dot to fix its team.</span>
       </div>
     </section>
   </div>
@@ -92,6 +100,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
       <label><input type="checkbox" id="oTrail" checked> 3 s trails</label>
       <label><input type="checkbox" id="oSlow"> Half speed</label>
       <label><input type="checkbox" id="oHeld" checked> Hold lost dots</label>
+      <label><input type="checkbox" id="oDots" checked> Tracked dots</label>
     </div>
   </div>
 
@@ -103,13 +112,15 @@ const params=new URLSearchParams(location.search);
 let GAME=params.get('game')||'2026-09-26';
 const vid=document.getElementById('vid'), vcan=document.getElementById('vcan'), rcan=document.getElementById('rcan');
 const scrub=document.getElementById('scrub'), clock=document.getElementById('clock'), playBtn=document.getElementById('play');
-let META=null, MIN={}, pending={}, tool=null, drawings=[], cur=null;
+let META=null, MIN={}, pending={}, tool=null, drawings=[], cur=null, DOTFIX={}, placed=[], dragging=null;
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 function fmt(t){t=Math.max(0,t||0);const m=Math.floor(t/60),s=Math.floor(t%60);return `${m}:${String(s).padStart(2,'0')}`}
 document.getElementById('notes').innerHTML=`<h3>How to read it</h3>
 <ul>
 <li><b>Solid dots</b> are seen by the tracker in this frame. <b>Faded dots</b> are held: either bridging a short dropout until the same player is picked up again nearby (up to 1.5 s), or parked at the last spot for 1 s after the player is lost.</li>
-<li><b>Fake dots removed:</b> flickers shorter than 0.6 s are dropped, two dots of the same color within 3 ft are merged, and no more than 6 dots per team are shown.</li>
+<li><b>Fake dots removed:</b> flickers shorter than 0.6 s are dropped, and no more than 6 dots per team are shown. Two dots are merged only when they sit on top of each other for a full second or more, so players crossing stay separate.</li>
+<li><b>Wrong color?</b> Pause and click the dot, then pick the right team, or "Not a player" for a coach or fan. The fix applies to that dot for the whole game and is saved.</li>
+<li><b>Teaching:</b> use + White dot, + Blue dot and + Puck to place your own markers, drag them around, and turn off "Tracked dots" for a clean board.</li>
 <li><b>When the camera can't be matched to the rink lines</b> (fast pans, faceoffs right under the camera) the dots disappear and the rink says so, instead of guessing.</li>
 <li><b>Accuracy</b> (measured on Sep 26): about 1 ft on the near side and center ice, 2 to 4 ft front to back along the far boards, and end-zone distances are stretched to a standard rink. Turn on "Rink lines on video" to check the fit at any moment.</li>
 </ul>`;
@@ -121,7 +132,8 @@ async function getMin(m){
   return null;
 }
 async function loadGame(id){
-  GAME=id; MIN={}; drawings=[];
+  GAME=id; MIN={}; drawings=[]; placed=[]; DOTFIX={};
+  fetch(`/api/games/${id}/rink/dotfix`).then(r=>r.ok?r.json():{}).then(d=>{DOTFIX=d||{}; draw()});
   document.querySelectorAll('#tabs button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.id===id));
   const r=await fetch(`/api/games/${id}/rink/meta`);
   if(!r.ok){META=null; document.getElementById('count').textContent='Rink view not built for this game yet'; vid.removeAttribute('src'); draw(); return}
@@ -173,11 +185,11 @@ function playersAt(t){
   const i=idxIn(D.times,t), j=Math.min(i+1,D.times.length-1), a=D.maps[i], b=D.maps[j], out=[];
   if(Math.abs(t-D.times[i])>0.25 && Math.abs(t-D.times[j])>0.25) return out;
   const span=D.times[j]-D.times[i], u=span>0?Math.min(1,Math.max(0,(t-D.times[i])/span)):0;
-  for(const [id,p] of a){const q=b.get(id); out.push(q?[id,p[1]+(q[1]-p[1])*u,p[2]+(q[2]-p[2])*u,p[3],p[4]]:p)}
+  for(const [id,p] of a){const q=b.get(id), tm=DOTFIX[id]||p[3]; if(tm==='x') continue; out.push(q?[id,p[1]+(q[1]-p[1])*u,p[2]+(q[2]-p[2])*u,tm,p[4]]:[id,p[1],p[2],tm,p[4]])}
   return out;
 }
 function trailFor(t,secs){const tr=new Map(); for(const m of new Set([Math.floor((t-secs)/60),Math.floor(t/60)])){const D=MIN[m]; if(!D||!D.times.length) continue;
-  const i0=idxIn(D.times,t-secs), i1=idxIn(D.times,t); for(let i=Math.max(i0,0);i<=i1;i++){ if(D.times[i]<t-secs||D.times[i]>t) continue; for(const [id,p] of D.maps[i]){ if(!tr.has(id)) tr.set(id,[]); tr.get(id).push([p[1],p[2],p[3]]) }}} return tr}
+  const i0=idxIn(D.times,t-secs), i1=idxIn(D.times,t); for(let i=Math.max(i0,0);i<=i1;i++){ if(D.times[i]<t-secs||D.times[i]>t) continue; for(const [id,p] of D.maps[i]){ const tm=DOTFIX[id]||p[3]; if(tm==='x') continue; if(!tr.has(id)) tr.set(id,[]); tr.get(id).push([p[1],p[2],tm]) }}} return tr}
 function camAt(t){const D=MIN[Math.floor(t/60)]; if(!D||!D.cam_t.length) return null; const i=idxIn(D.cam_t,t); return {H:D.H[i],foot:D.foot[i],good:D.good[i]}}
 const teamColor=c=>c==='w'?css('--us'):c==='b'?css('--them'):c==='r'?css('--ref'):'#9aa3ad';
 function applyH(H,x,y){const X=H[0]*x+H[1]*y+H[2],Y=H[3]*x+H[4]*y+H[5],Z=H[6]*x+H[7]*y+H[8];if(Z<=0)return null;let u=(X/Z-960)/960,v=(Y/Z-540)/960;const k=META.k1||0,q=u*u+v*v; if(q>2.2)return null; const r=1+k*q;return [u*r*960+960,v*r*960+540]}
@@ -194,15 +206,19 @@ function draw(){
   if(okMap&&document.getElementById('oCam').checked&&cam.foot&&cam.foot.length>2){
     ctx.save(); roundRect(ctx,X,s); ctx.clip(); ctx.beginPath(); cam.foot.forEach((p,i)=>{const a=X.f(p[0],p[1]); i?ctx.lineTo(...a):ctx.moveTo(...a)}); ctx.closePath();
     ctx.fillStyle='rgba(31,95,174,.13)'; ctx.fill(); ctx.strokeStyle='rgba(31,95,174,.45)'; ctx.lineWidth=R.k; ctx.stroke(); ctx.restore()}
-  const showHeld=document.getElementById('oHeld').checked;
-  if(document.getElementById('oTrail').checked){for(const [id,pts] of trailFor(t,3)){ if(pts.length<2) continue; ctx.beginPath(); pts.forEach((p,i)=>{const a=X.f(p[0],p[1]); i?ctx.lineTo(...a):ctx.moveTo(...a)});
+  const showHeld=document.getElementById('oHeld').checked, showDots=document.getElementById('oDots').checked;
+  if(showDots&&document.getElementById('oTrail').checked){for(const [id,pts] of trailFor(t,3)){ if(pts.length<2) continue; ctx.beginPath(); pts.forEach((p,i)=>{const a=X.f(p[0],p[1]); i?ctx.lineTo(...a):ctx.moveTo(...a)});
     const c=pts[0][2]; ctx.strokeStyle=c==='w'?'rgba(23,32,42,.35)':c==='b'?'rgba(47,111,224,.45)':'rgba(60,60,60,.3)'; ctx.lineWidth=1.5*R.k; ctx.stroke()}}
-  const ps=playersAt(t).filter(p=>showHeld||!p[4]); let nW=0,nB=0;
+  const ps=showDots?playersAt(t).filter(p=>showHeld||!p[4]):[]; SHOWN=ps; let nW=0,nB=0;
   for(const p of ps){const a=X.f(p[1],p[2]); ctx.globalAlpha=p[4]?0.45:1; ctx.beginPath(); ctx.arc(a[0],a[1],Math.max(5*R.k,1.6*X.sc),0,7);
     ctx.fillStyle=teamColor(p[3]); ctx.fill(); ctx.lineWidth=1.6*R.k; ctx.strokeStyle=p[3]==='w'?css('--usring'):'rgba(255,255,255,.9)'; if(p[4]) ctx.setLineDash([3*R.k,2*R.k]); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
     if(p[3]==='w')nW++; if(p[3]==='b')nB++}
   document.getElementById('count').textContent=!MIN[m]?'Loading…':okMap||ps.length?`${nW} white · ${nB} blue`:'Camera moving too fast to map';
   if(MIN[m]&&!okMap&&!ps.length){ctx.fillStyle='rgba(23,32,42,.55)';ctx.font=`${14*R.k}px Inter, sans-serif`;ctx.textAlign='center';ctx.fillText('Mapping lost on this pan. Dots hidden.',R.w/2,R.h/2)}
+  for(const d of placed){const a=X.f(d.x,d.y); ctx.beginPath();
+    if(d.c==='p'){ctx.arc(a[0],a[1],Math.max(4*R.k,1.1*X.sc),0,7); ctx.fillStyle='#111'; ctx.fill()}
+    else{ctx.arc(a[0],a[1],Math.max(7*R.k,2.2*X.sc),0,7); ctx.fillStyle=teamColor(d.c); ctx.fill(); ctx.lineWidth=2*R.k; ctx.strokeStyle=d.c==='w'?css('--usring'):'rgba(255,255,255,.9)'; ctx.stroke();
+      ctx.lineWidth=2*R.k; ctx.strokeStyle=css('--pen'); ctx.beginPath(); ctx.arc(a[0],a[1],Math.max(7*R.k,2.2*X.sc)+3*R.k,0,7); ctx.stroke()}}
   const all=cur?drawings.concat([cur]):drawings;
   for(const d of all){ ctx.strokeStyle=css('--pen'); ctx.fillStyle=css('--pen'); ctx.lineWidth=3*R.k; ctx.lineCap='round'; ctx.lineJoin='round';
     const pts=d.pts.map(p=>X.f(p[0],p[1])); if(pts.length<2) continue;
@@ -227,11 +243,33 @@ document.getElementById('oSlow').onchange=e=>{vid.playbackRate=e.target.checked?
 ['oLines','oCam','oTrail','oHeld'].forEach(id=>document.getElementById(id).onchange=draw);
 window.addEventListener('resize',draw);
 document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT')return; if(e.code==='Space'){e.preventDefault();playBtn.click()} if(e.code==='ArrowRight'){vid.currentTime+=5;draw()} if(e.code==='ArrowLeft'){vid.currentTime-=5;draw()}});
-function setTool(t){tool=tool===t?null:t; document.getElementById('tPen').setAttribute('aria-pressed',tool==='pen'); document.getElementById('tArrow').setAttribute('aria-pressed',tool==='arrow'); rcan.style.cursor=tool?'crosshair':'default'}
-document.getElementById('tPen').onclick=()=>setTool('pen'); document.getElementById('tArrow').onclick=()=>setTool('arrow');
-document.getElementById('tClear').onclick=()=>{drawings=[];draw()};
+let SHOWN=[];
+const TOOLS={tPen:'pen',tArrow:'arrow',tW:'w',tB:'b',tP:'p'};
+function setTool(t){tool=tool===t?null:t; for(const [id,v] of Object.entries(TOOLS)) document.getElementById(id).setAttribute('aria-pressed',tool===v); rcan.style.cursor=tool?'crosshair':'default'; hideMenu()}
+for(const [id,v] of Object.entries(TOOLS)) document.getElementById(id).onclick=()=>setTool(v);
+document.getElementById('tClear').onclick=()=>{drawings=[];placed=[];draw()};
+document.getElementById('oDots').onchange=draw;
+function rinkScale(){const s=rinkShapes(STD); return rinkXf(rcan.width,rcan.height,s).sc}
+function nearest(list,p,ft){let best=null,bd=ft; for(const d of list){const dd=Math.hypot(d[0]-p[0],d[1]-p[1]); if(dd<bd){bd=dd;best=d}} return best}
+/* team-fix menu */
+const menu=document.createElement('div'); menu.className='fixmenu'; menu.hidden=true; document.body.appendChild(menu);
+function hideMenu(){menu.hidden=true}
+function showMenu(e,id){
+  menu.innerHTML='<div class="fm-h">This dot is</div>'+[['w','White'],['b','Blue'],['r','Referee'],['x','Not a player']].map(([k,l])=>`<button data-k="${k}">${l}</button>`).join('');
+  menu.style.left=Math.min(e.clientX+8, innerWidth-170)+'px'; menu.style.top=(e.clientY+8+scrollY)+'px'; menu.hidden=false;
+  menu.querySelectorAll('button').forEach(b=>b.onclick=async()=>{const k=b.dataset.k; DOTFIX[id]=k; hideMenu(); draw();
+    try{const r=await fetch(`/api/games/${GAME}/rink/teamfix`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dot:+id,team:k})}); if(!r.ok) throw 0}
+    catch(_){document.getElementById('count').textContent='Could not save that fix. Try again.'}});
+}
+document.addEventListener('pointerdown',e=>{if(!menu.hidden&&!menu.contains(e.target)&&e.target!==rcan) hideMenu()});
+rcan.addEventListener('contextmenu',e=>{const p=rinkPt(e), d=nearest(placed.map(q=>[q.x,q.y,q]),p,3); if(d){e.preventDefault(); placed=placed.filter(q=>q!==d[2]); draw()}});
 function rinkPt(e){const r=rcan.getBoundingClientRect(),k=window.devicePixelRatio||1; const s=rinkShapes(STD), X=rinkXf(rcan.width,rcan.height,s); return X.inv((e.clientX-r.left)*k,(e.clientY-r.top)*k)}
-rcan.addEventListener('pointerdown',e=>{if(!tool)return; vid.pause(); rcan.setPointerCapture(e.pointerId); cur={kind:tool,pts:[rinkPt(e)]}; draw()});
-rcan.addEventListener('pointermove',e=>{if(!cur)return; const p=rinkPt(e); if(cur.kind==='pen')cur.pts.push(p); else cur.pts[1]=p; draw()});
-rcan.addEventListener('pointerup',()=>{if(cur){drawings.push(cur);cur=null;draw()}});
+rcan.addEventListener('pointerdown',e=>{if(e.button!==0)return; const p=rinkPt(e); hideMenu();
+  const pd=nearest(placed.map(q=>[q.x,q.y,q]),p,3);
+  if(pd&&tool!=='pen'&&tool!=='arrow'){vid.pause(); dragging=pd[2]; rcan.setPointerCapture(e.pointerId); return}
+  if(tool==='w'||tool==='b'||tool==='p'){vid.pause(); const d={x:p[0],y:p[1],c:tool}; placed.push(d); dragging=d; rcan.setPointerCapture(e.pointerId); draw(); return}
+  if(tool){vid.pause(); rcan.setPointerCapture(e.pointerId); cur={kind:tool,pts:[p]}; draw(); return}
+  const hit=nearest(SHOWN.map(q=>[q[1],q[2],q[0]]),p,4); if(hit){vid.pause(); showMenu(e,hit[2])}});
+rcan.addEventListener('pointermove',e=>{const p=rinkPt(e); if(dragging){dragging.x=p[0];dragging.y=p[1];draw();return} if(!cur)return; if(cur.kind==='pen')cur.pts.push(p); else cur.pts[1]=p; draw()});
+rcan.addEventListener('pointerup',()=>{dragging=null; if(cur){drawings.push(cur);cur=null;draw()}});
 </script></body></html>
