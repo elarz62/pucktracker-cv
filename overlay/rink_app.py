@@ -451,7 +451,21 @@ def learn_teams(game_id, team, fixes, feats, hmed, colors, out):
     tp = DATA / "games" / game_id / "tags.json"
     tags = {pk(a): ours for a, v in (json.loads(tp.read_text()) if tp.exists() else {}).items() if str(v).isdigit()}
     rules = np.array([team[k] for k in keys])
-    y = np.array([fx.get(k, tags.get(k, team[k])) for k in keys])
+    raw_rules = rules.copy()
+    # the trained team model (team_model_app.py), when this game has predictions: its confident calls
+    # replace the color rules as the starting point, and its probabilities become extra features
+    pp = DATA / "games" / game_id / "rink" / "team_pred.json"
+    nn = json.loads(pp.read_text()) if pp.exists() else None
+    if nn:
+        code = {"ours": ours, "them": "b" if ours == "w" else "w", "ref": "r", "other": "x"}
+        cls_nn = nn["classes"]
+        Pn = np.array([nn["tracks"].get(f"{k[0]}:{k[1]}", [0.25] * len(cls_nn)) for k in keys])
+        for i in range(len(keys)):
+            j = int(np.argmax(Pn[i]))
+            if Pn[i, j] >= 0.6:
+                rules[i] = code[cls_nn[j]]
+        X = np.c_[X, Pn * 3]
+    y = np.array([fx.get(k, tags.get(k, rules[i])) for i, k in enumerate(keys)])
     wt = np.array([30.0 if k in fx else 10.0 if k in tags else 1.0 for k in keys])
 
     def fit(mask):
@@ -464,7 +478,7 @@ def learn_teams(game_id, team, fixes, feats, hmed, colors, out):
         cls = np.array(m.classes_)
         j = P.argmax(1)
         pred = cls[j]
-        sure = (P[np.arange(len(idx)), j] >= 0.75) & np.isin(pred, ["w", "b", "r"])
+        sure = (P[np.arange(len(idx)), j] >= 0.75) & np.isin(pred, ["w", "b", "r", "x"])
         return np.where(sure, pred, rules[idx])
 
     tag_idx = np.array([i for i, k in enumerate(keys) if k in tags and k not in fx])
@@ -479,11 +493,12 @@ def learn_teams(game_id, team, fixes, feats, hmed, colors, out):
             mask[hide] = False
             got[fold == f_] = relabel(fit(mask), hide)
         n_ = len(tag_idx)
-        ev = {"tagged_players": int(n_), "rules_right_pct": round(100 * float((rules[tag_idx] == ours).mean()), 1),
+        ev = {"tagged_players": int(n_), "rules_right_pct": round(100 * float((raw_rules[tag_idx] == ours).mean()), 1),
+              "team_model_used": bool(nn),
               "learned_right_pct": round(100 * float((got == ours).mean()), 1)}
     m = fit(np.ones(len(keys), bool))
     new = relabel(m, np.arange(len(keys)))
-    changed = {k: str(new[i]) for i, k in enumerate(keys) if new[i] != rules[i]}
+    changed = {k: str(new[i]) for i, k in enumerate(keys) if new[i] != raw_rules[i]}
     (out / "team_model.pkl").write_bytes(pickle.dumps({"model": m, "classes": list(m.classes_)}))
     # keep every labeled color signature so later games can start from all of them
     lib = DATA / "models" / "team_fixes"
@@ -491,7 +506,7 @@ def learn_teams(game_id, team, fixes, feats, hmed, colors, out):
     (lib / f"{game_id}.pkl").write_bytes(pickle.dumps({k: (X[i], y[i], wt[i]) for i, k in enumerate(keys) if wt[i] > 1}))
     info = {"fixes": len(fx), "tags": len(tags), "players": len(keys), "recolored": len(changed),
             "recolored_to": {c: sum(v == c for v in changed.values()) for c in "wbr"}, **ev}
-    (out / "learn_changes.json").write_text(json.dumps({f"{k[0]}:{k[1]}": [str(rules[keys.index(k)]), v] for k, v in changed.items()}))
+    (out / "learn_changes.json").write_text(json.dumps({f"{k[0]}:{k[1]}": [str(raw_rules[keys.index(k)]), v] for k, v in changed.items()}))
     (out / "learn.json").write_text(json.dumps({**info, "built": __import__("time").time()}))
     return {**info, "changed": changed}
 
@@ -547,6 +562,7 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, colors=None, min_l
         is_b = bl > cfg["blue_frac"] or ot == "blue" or oc > 0.2
         team[key] = "b" if is_b else ("r" if h > cfg["ref_ratio"] * hmed and len(v) >= 3 else "w")
     # team fixes made by clicking dots on the /rink page (track key "part:tid" -> team)
+    (out / "rules_team.json").write_text(json.dumps({f"{k[0]}:{k[1]}": v for k, v in team.items()}))
     fixp = DATA / "games" / game_id / "rink" / "team_fix.json"
     fixes = json.loads(fixp.read_text()) if fixp.exists() else {}
     learn = learn_teams(game_id, team, fixes, feats, hmed, colors or {}, out)
