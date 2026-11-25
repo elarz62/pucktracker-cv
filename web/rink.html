@@ -1,0 +1,237 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PuckTracker Rink View</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: broadcast-booth split. Video left, rink right, one transport bar under both. */
+:root{
+  --bg:#eef1f4; --panel:#ffffff; --fg:#17202a; --muted:#5b6774; --line:#d5dbe2;
+  --accent:#1f5fae; --ice:#f7fafc; --rinkline:#b8c2cc; --red:#d0312d; --blue:#2c5fb8;
+  --us:#ffffff; --usring:#17202a; --them:#2f6fe0; --ref:#2b2b2b; --pen:#f2b705;
+  --display:"Barlow Condensed","Arial Narrow",sans-serif; --body:Inter,system-ui,sans-serif; --mono:"JetBrains Mono",ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#10151b; --panel:#18202a; --fg:#e8edf2; --muted:#9aa7b4; --line:#2a3441; --accent:#6aa5f0;
+  --ice:#e9eef3; --rinkline:#aab6c2; color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#10151b; --panel:#18202a; --fg:#e8edf2; --muted:#9aa7b4; --line:#2a3441; --accent:#6aa5f0; --ice:#e9eef3; --rinkline:#aab6c2; color-scheme:dark}
+body{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:15px;line-height:1.5}
+.wrap{max-width:1500px;margin:0 auto;padding-block:20px 40px;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));display:grid;gap:16px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:12px}
+h1{font-family:var(--display);font-weight:700;font-size:2rem;letter-spacing:.02em;margin:0;text-transform:uppercase}
+.sub{color:var(--muted);margin:0}
+.tabs{display:flex;gap:6px;flex-wrap:wrap}
+.tabs button,.tool{font:500 14px var(--body);border:1px solid var(--line);background:var(--panel);color:var(--fg);padding:6px 12px;border-radius:6px;cursor:pointer}
+.tabs button[aria-pressed="true"],.tool[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#fff}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.stage{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:12px;align-items:start}
+@media (max-width:900px){.stage{grid-template-columns:minmax(0,1fr)}}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px;min-width:0}
+.pane h2{font-family:var(--display);font-size:1.05rem;letter-spacing:.08em;text-transform:uppercase;margin:0;color:var(--muted);display:flex;justify-content:space-between;gap:8px}
+.vidbox{position:relative;width:100%;aspect-ratio:16/9;background:#000;border-radius:4px;overflow:hidden;max-width:100%}
+.vidbox video,.vidbox canvas{position:absolute;inset:0;width:100%;height:100%}
+.rinkbox{position:relative;width:100%;aspect-ratio:2.25/1;max-width:100%}
+.rinkbox canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+.transport{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center}
+.transport .play{font:600 15px var(--body);width:88px;padding:8px 0;border-radius:6px;border:0;background:var(--accent);color:#fff;cursor:pointer}
+#scrub{flex:1 1 260px;min-width:0;accent-color:var(--accent)}
+.clock{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--muted);min-width:96px}
+.opts{display:flex;flex-wrap:wrap;gap:6px 14px;color:var(--muted);font-size:14px}
+.opts label{display:flex;gap:6px;align-items:center;cursor:pointer}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--muted);align-items:center}
+.dot{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px;margin-right:4px}
+.tools{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.notes{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 18px;display:grid;gap:8px}
+.notes h3{font-family:var(--display);text-transform:uppercase;letter-spacing:.06em;margin:0;font-size:1.15rem}
+.notes p,.notes li{max-width:75ch;margin:0}
+.notes ul{margin:0;padding-left:20px;display:grid;gap:4px}
+.status{font-size:13px;color:var(--muted)}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto}}
+</style></head><body>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Rink View</h1>
+      <p class="sub">Full game. Dots are each player's skates mapped from the camera to the ice, colored by jersey only. Faded dots are held in place for a moment after the tracker loses a player.</p>
+    </div>
+    <div class="tabs" id="tabs" role="group" aria-label="Game"></div>
+  </header>
+
+  <div class="stage">
+    <section class="pane">
+      <h2><span>Game video</span><span id="gameName"></span></h2>
+      <div class="vidbox">
+        <video id="vid" muted playsinline preload="auto"></video>
+        <canvas id="vcan"></canvas>
+      </div>
+    </section>
+    <section class="pane">
+      <h2><span>Bird's-eye rink</span><span class="status" id="count"></span></h2>
+      <div class="rinkbox"><canvas id="rcan"></canvas></div>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--us);box-shadow:0 0 0 2px var(--usring)"></span>White jerseys</span>
+        <span><span class="dot" style="background:var(--them)"></span>Blue jerseys</span>
+        <span><span class="dot" style="background:var(--ref)"></span>Referees</span>
+        <span><span class="dot" style="background:rgba(31,95,174,.18);border-radius:2px"></span>What the camera sees</span>
+      </div>
+      <div class="tools" aria-label="Drawing tools">
+        <button class="tool" id="tPen" aria-pressed="false">Pen</button>
+        <button class="tool" id="tArrow" aria-pressed="false">Arrow</button>
+        <button class="tool" id="tClear">Clear drawings</button>
+        <span class="status">Drawing pauses the video. Drawings stay until cleared.</span>
+      </div>
+    </section>
+  </div>
+
+  <div class="transport">
+    <button class="play" id="play">Play</button>
+    <input type="range" id="scrub" min="0" max="3600" step="0.01" value="0" aria-label="Seek">
+    <span class="clock" id="clock">0:00 / 0:00</span>
+    <div class="opts">
+      <label><input type="checkbox" id="oLines" checked> Rink lines on video</label>
+      <label><input type="checkbox" id="oCam" checked> Camera view</label>
+      <label><input type="checkbox" id="oTrail" checked> 3 s trails</label>
+      <label><input type="checkbox" id="oSlow"> Half speed</label>
+      <label><input type="checkbox" id="oHeld" checked> Hold lost dots</label>
+    </div>
+  </div>
+
+  <section class="notes" id="notes"></section>
+</div>
+
+<script>
+const params=new URLSearchParams(location.search);
+let GAME=params.get('game')||'2026-09-26';
+const vid=document.getElementById('vid'), vcan=document.getElementById('vcan'), rcan=document.getElementById('rcan');
+const scrub=document.getElementById('scrub'), clock=document.getElementById('clock'), playBtn=document.getElementById('play');
+let META=null, MIN={}, pending={}, tool=null, drawings=[], cur=null;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+function fmt(t){t=Math.max(0,t||0);const m=Math.floor(t/60),s=Math.floor(t%60);return `${m}:${String(s).padStart(2,'0')}`}
+document.getElementById('notes').innerHTML=`<h3>How to read it</h3>
+<ul>
+<li><b>Solid dots</b> are seen by the tracker in this frame. <b>Faded dots</b> are held: either bridging a short dropout until the same player is picked up again nearby (up to 1.5 s), or parked at the last spot for 1 s after the player is lost.</li>
+<li><b>Fake dots removed:</b> flickers shorter than 0.6 s are dropped, two dots of the same color within 3 ft are merged, and no more than 6 dots per team are shown.</li>
+<li><b>When the camera can't be matched to the rink lines</b> (fast pans, faceoffs right under the camera) the dots disappear and the rink says so, instead of guessing.</li>
+<li><b>Accuracy</b> (measured on Sep 26): about 1 ft on the near side and center ice, 2 to 4 ft front to back along the far boards, and end-zone distances are stretched to a standard rink. Turn on "Rink lines on video" to check the fit at any moment.</li>
+</ul>`;
+async function getMin(m){
+  if(MIN[m]||pending[m]||m<0||!META||m>=META.minutes) return MIN[m];
+  pending[m]=fetch(`/api/games/${GAME}/rink/${m}`).then(r=>r.ok?r.json():null).then(d=>{
+    if(d){d.times=d.frames.map(f=>f[0]); d.maps=d.frames.map(f=>{const mp=new Map(); for(const p of f[1]) mp.set(p[0],p); return mp});}
+    MIN[m]=d||{times:[],maps:[],cam_t:[],H:[],foot:[],good:[]}; delete pending[m]; draw(); return MIN[m]});
+  return null;
+}
+async function loadGame(id){
+  GAME=id; MIN={}; drawings=[];
+  document.querySelectorAll('#tabs button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.id===id));
+  const r=await fetch(`/api/games/${id}/rink/meta`);
+  if(!r.ok){META=null; document.getElementById('count').textContent='Rink view not built for this game yet'; vid.removeAttribute('src'); draw(); return}
+  META=await r.json(); vid.src=`/video/${id}/master.mp4`; scrub.max=META.duration;
+  document.getElementById('gameName').textContent=document.querySelector(`#tabs button[data-id="${id}"]`)?.textContent||id;
+  getMin(0); draw();
+}
+fetch('/api/games').then(r=>r.json()).then(gs=>{const tabs=document.getElementById('tabs');
+  for(const g of gs){const b=document.createElement('button'); b.textContent=g.title||g.id; b.dataset.id=g.id; b.onclick=()=>loadGame(g.id); tabs.appendChild(b)}
+  loadGame(GAME)});
+const STD={W:42.5,blue:25,doty:22,goal:89};
+/* ---------- rink geometry (feet, origin center ice, +y far boards) ---------- */
+function rinkShapes(d){
+  const W=d.W, L=d.goal+11, R=Math.min(28, W), b=d.blue, g=d.goal, dy=d.doty;
+  return {W,L,R,b,g,dy,nz:b-5,ez:g-20};
+}
+function sizeCanvas(c){const r=c.getBoundingClientRect(),k=window.devicePixelRatio||1;
+  if(c.width!==Math.round(r.width*k)||c.height!==Math.round(r.height*k)){c.width=Math.round(r.width*k);c.height=Math.round(r.height*k)}
+  return {w:c.width,h:c.height,k}}
+
+function rinkXf(w,h,s){ // rink ft -> canvas px
+  const pad=10*(window.devicePixelRatio||1);
+  const sc=Math.min((w-2*pad)/(2*s.L),(h-2*pad)/(2*s.W));
+  const cx=w/2, cy=h/2;
+  return {sc, f:(x,y)=>[cx+x*sc, cy-y*sc], inv:(px,py)=>[(px-cx)/sc,(cy-py)/sc]};
+}
+function roundRect(ctx,X,s){
+  const [x0,y0]=X.f(-s.L,s.W); ctx.beginPath(); ctx.roundRect(x0,y0,2*s.L*X.sc,2*s.W*X.sc,s.R*X.sc);
+}
+function drawRink(ctx,X,s,k){
+  ctx.save(); roundRect(ctx,X,s); ctx.fillStyle=css('--ice'); ctx.fill(); ctx.clip();
+  const line=(x1,y1,x2,y2,c,w)=>{ctx.beginPath();const a=X.f(x1,y1),b=X.f(x2,y2);ctx.moveTo(...a);ctx.lineTo(...b);ctx.strokeStyle=c;ctx.lineWidth=w;ctx.stroke()};
+  const circ=(x,y,r,c,w,fill)=>{ctx.beginPath();const a=X.f(x,y);ctx.arc(a[0],a[1],r*X.sc,0,7);if(fill){ctx.fillStyle=c;ctx.fill()}else{ctx.strokeStyle=c;ctx.lineWidth=w;ctx.stroke()}};
+  const red=css('--red'), blue=css('--blue');
+  line(0,-s.W,0,s.W,red,1*X.sc); line(s.b,-s.W,s.b,s.W,blue,1*X.sc); line(-s.b,-s.W,-s.b,s.W,blue,1*X.sc);
+  line(s.g,-s.W,s.g,s.W,red,.35*X.sc); line(-s.g,-s.W,-s.g,s.W,red,.35*X.sc);
+  circ(0,0,15,blue,.3*X.sc); circ(0,0,.6,blue,0,true);
+  for(const sx of[-1,1])for(const sy of[-1,1]){circ(sx*s.ez,sy*s.dy,15,red,.3*X.sc);circ(sx*s.ez,sy*s.dy,1,red,0,true);circ(sx*s.nz,sy*s.dy,1,red,0,true)}
+  ctx.beginPath();const c0=X.f(0,-s.W);ctx.arc(c0[0],c0[1],10*X.sc,Math.PI,0);ctx.strokeStyle=red;ctx.lineWidth=.3*X.sc;ctx.stroke();
+  for(const sx of[-1,1]){ctx.beginPath();const a=X.f(sx*s.g,0);ctx.arc(a[0],a[1],6*X.sc,sx>0?Math.PI/2:-Math.PI/2,sx>0?3*Math.PI/2:Math.PI/2);ctx.fillStyle='rgba(80,150,230,.25)';ctx.fill()}
+  ctx.restore();
+  roundRect(ctx,X,s); ctx.strokeStyle=css('--rinkline'); ctx.lineWidth=2*k; ctx.stroke();
+}
+
+
+function idxIn(arr,t){let lo=0,hi=arr.length-1;if(hi<0)return -1;if(t<=arr[0])return 0;while(hi-lo>1){const m=(lo+hi)>>1;if(arr[m]<=t)lo=m;else hi=m}return lo}
+function playersAt(t){
+  const D=MIN[Math.floor(t/60)]; if(!D||!D.times.length) return [];
+  const i=idxIn(D.times,t), j=Math.min(i+1,D.times.length-1), a=D.maps[i], b=D.maps[j], out=[];
+  if(Math.abs(t-D.times[i])>0.25 && Math.abs(t-D.times[j])>0.25) return out;
+  const span=D.times[j]-D.times[i], u=span>0?Math.min(1,Math.max(0,(t-D.times[i])/span)):0;
+  for(const [id,p] of a){const q=b.get(id); out.push(q?[id,p[1]+(q[1]-p[1])*u,p[2]+(q[2]-p[2])*u,p[3],p[4]]:p)}
+  return out;
+}
+function trailFor(t,secs){const tr=new Map(); for(const m of new Set([Math.floor((t-secs)/60),Math.floor(t/60)])){const D=MIN[m]; if(!D||!D.times.length) continue;
+  const i0=idxIn(D.times,t-secs), i1=idxIn(D.times,t); for(let i=Math.max(i0,0);i<=i1;i++){ if(D.times[i]<t-secs||D.times[i]>t) continue; for(const [id,p] of D.maps[i]){ if(!tr.has(id)) tr.set(id,[]); tr.get(id).push([p[1],p[2],p[3]]) }}} return tr}
+function camAt(t){const D=MIN[Math.floor(t/60)]; if(!D||!D.cam_t.length) return null; const i=idxIn(D.cam_t,t); return {H:D.H[i],foot:D.foot[i],good:D.good[i]}}
+const teamColor=c=>c==='w'?css('--us'):c==='b'?css('--them'):c==='r'?css('--ref'):'#9aa3ad';
+function applyH(H,x,y){const X=H[0]*x+H[1]*y+H[2],Y=H[3]*x+H[4]*y+H[5],Z=H[6]*x+H[7]*y+H[8];if(Z<=0)return null;let u=(X/Z-960)/960,v=(Y/Z-540)/960;const k=META.k1||0,q=u*u+v*v; if(q>2.2)return null; const r=1+k*q;return [u*r*960+960,v*r*960+540]}
+function draw(){
+  const t=vid.currentTime||0;
+  scrub.value=t; clock.textContent=`${fmt(t)} / ${fmt(META?META.duration:0)}`;
+  const s=rinkShapes(STD);
+  const R=sizeCanvas(rcan), ctx=rcan.getContext('2d'); ctx.clearRect(0,0,R.w,R.h);
+  const X=rinkXf(R.w,R.h,s); drawRink(ctx,X,s,R.k);
+  const V=sizeCanvas(vcan), vc=vcan.getContext('2d'); vc.clearRect(0,0,V.w,V.h);
+  if(!META) return;
+  const m=Math.floor(t/60); getMin(m); if(t%60>45) getMin(m+1);
+  const cam=camAt(t); const okMap=cam&&cam.good;
+  if(okMap&&document.getElementById('oCam').checked&&cam.foot&&cam.foot.length>2){
+    ctx.save(); roundRect(ctx,X,s); ctx.clip(); ctx.beginPath(); cam.foot.forEach((p,i)=>{const a=X.f(p[0],p[1]); i?ctx.lineTo(...a):ctx.moveTo(...a)}); ctx.closePath();
+    ctx.fillStyle='rgba(31,95,174,.13)'; ctx.fill(); ctx.strokeStyle='rgba(31,95,174,.45)'; ctx.lineWidth=R.k; ctx.stroke(); ctx.restore()}
+  const showHeld=document.getElementById('oHeld').checked;
+  if(document.getElementById('oTrail').checked){for(const [id,pts] of trailFor(t,3)){ if(pts.length<2) continue; ctx.beginPath(); pts.forEach((p,i)=>{const a=X.f(p[0],p[1]); i?ctx.lineTo(...a):ctx.moveTo(...a)});
+    const c=pts[0][2]; ctx.strokeStyle=c==='w'?'rgba(23,32,42,.35)':c==='b'?'rgba(47,111,224,.45)':'rgba(60,60,60,.3)'; ctx.lineWidth=1.5*R.k; ctx.stroke()}}
+  const ps=playersAt(t).filter(p=>showHeld||!p[4]); let nW=0,nB=0;
+  for(const p of ps){const a=X.f(p[1],p[2]); ctx.globalAlpha=p[4]?0.45:1; ctx.beginPath(); ctx.arc(a[0],a[1],Math.max(5*R.k,1.6*X.sc),0,7);
+    ctx.fillStyle=teamColor(p[3]); ctx.fill(); ctx.lineWidth=1.6*R.k; ctx.strokeStyle=p[3]==='w'?css('--usring'):'rgba(255,255,255,.9)'; if(p[4]) ctx.setLineDash([3*R.k,2*R.k]); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha=1;
+    if(p[3]==='w')nW++; if(p[3]==='b')nB++}
+  document.getElementById('count').textContent=!MIN[m]?'Loading…':okMap||ps.length?`${nW} white · ${nB} blue`:'Camera moving too fast to map';
+  if(MIN[m]&&!okMap&&!ps.length){ctx.fillStyle='rgba(23,32,42,.55)';ctx.font=`${14*R.k}px Inter, sans-serif`;ctx.textAlign='center';ctx.fillText('Mapping lost on this pan. Dots hidden.',R.w/2,R.h/2)}
+  const all=cur?drawings.concat([cur]):drawings;
+  for(const d of all){ ctx.strokeStyle=css('--pen'); ctx.fillStyle=css('--pen'); ctx.lineWidth=3*R.k; ctx.lineCap='round'; ctx.lineJoin='round';
+    const pts=d.pts.map(p=>X.f(p[0],p[1])); if(pts.length<2) continue;
+    if(d.kind==='pen'){ctx.beginPath(); pts.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p)); ctx.stroke()}
+    else {const a=pts[0], b=pts[pts.length-1]; ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+      const ang=Math.atan2(b[1]-a[1],b[0]-a[0]), hl=14*R.k; ctx.beginPath(); ctx.moveTo(...b); ctx.lineTo(b[0]-hl*Math.cos(ang-0.45),b[1]-hl*Math.sin(ang-0.45)); ctx.lineTo(b[0]-hl*Math.cos(ang+0.45),b[1]-hl*Math.sin(ang+0.45)); ctx.closePath(); ctx.fill()}}
+  if(okMap&&document.getElementById('oLines').checked&&cam.H){
+    const H=cam.H, sx=V.w/1920, sy=V.h/1080, sm=rinkShapes(META.dims);
+    const seg=(x1,y1,x2,y2,c)=>{vc.beginPath(); let on=false; for(let k=0;k<=40;k++){const u=k/40,p=applyH(H,x1+(x2-x1)*u,y1+(y2-y1)*u); if(!p||Math.abs(p[0])>5000||Math.abs(p[1])>5000){on=false;continue} const q=[p[0]*sx,p[1]*sy]; on?vc.lineTo(...q):vc.moveTo(...q); on=true} vc.strokeStyle=c; vc.lineWidth=2*V.k; vc.stroke()};
+    seg(0,-sm.W,0,sm.W,'rgba(255,60,60,.9)'); seg(sm.b,-sm.W,sm.b,sm.W,'rgba(60,120,255,.95)'); seg(-sm.b,-sm.W,-sm.b,sm.W,'rgba(60,120,255,.95)');
+    seg(sm.g,-sm.W+6,sm.g,sm.W-6,'rgba(255,60,60,.9)'); seg(-sm.g,-sm.W+6,-sm.g,sm.W-6,'rgba(255,60,60,.9)'); seg(-40,sm.W,40,sm.W,'rgba(255,220,0,.95)');
+    vc.beginPath(); let on=false; for(let k=0;k<=72;k++){const a=k/72*2*Math.PI,p=applyH(H,15*Math.cos(a),15*Math.sin(a)); if(!p){on=false;continue} const q=[p[0]*sx,p[1]*sy]; on?vc.lineTo(...q):vc.moveTo(...q); on=true} vc.strokeStyle='rgba(60,120,255,.95)'; vc.stroke();
+  }
+}
+function loop(){draw(); if(!vid.paused) requestAnimationFrame(loop)}
+playBtn.onclick=()=>{ if(vid.paused) vid.play(); else vid.pause() };
+vid.addEventListener('play',()=>{playBtn.textContent='Pause'; requestAnimationFrame(loop)});
+vid.addEventListener('pause',()=>{playBtn.textContent='Play'; draw()});
+vid.addEventListener('seeked',draw); vid.addEventListener('loadeddata',draw);
+scrub.addEventListener('input',()=>{vid.currentTime=+scrub.value; draw()});
+document.getElementById('oSlow').onchange=e=>{vid.playbackRate=e.target.checked?0.5:1};
+['oLines','oCam','oTrail','oHeld'].forEach(id=>document.getElementById(id).onchange=draw);
+window.addEventListener('resize',draw);
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT')return; if(e.code==='Space'){e.preventDefault();playBtn.click()} if(e.code==='ArrowRight'){vid.currentTime+=5;draw()} if(e.code==='ArrowLeft'){vid.currentTime-=5;draw()}});
+function setTool(t){tool=tool===t?null:t; document.getElementById('tPen').setAttribute('aria-pressed',tool==='pen'); document.getElementById('tArrow').setAttribute('aria-pressed',tool==='arrow'); rcan.style.cursor=tool?'crosshair':'default'}
+document.getElementById('tPen').onclick=()=>setTool('pen'); document.getElementById('tArrow').onclick=()=>setTool('arrow');
+document.getElementById('tClear').onclick=()=>{drawings=[];draw()};
+function rinkPt(e){const r=rcan.getBoundingClientRect(),k=window.devicePixelRatio||1; const s=rinkShapes(STD), X=rinkXf(rcan.width,rcan.height,s); return X.inv((e.clientX-r.left)*k,(e.clientY-r.top)*k)}
+rcan.addEventListener('pointerdown',e=>{if(!tool)return; vid.pause(); rcan.setPointerCapture(e.pointerId); cur={kind:tool,pts:[rinkPt(e)]}; draw()});
+rcan.addEventListener('pointermove',e=>{if(!cur)return; const p=rinkPt(e); if(cur.kind==='pen')cur.pts.push(p); else cur.pts[1]=p; draw()});
+rcan.addEventListener('pointerup',()=>{if(cur){drawings.push(cur);cur=null;draw()}});
+</script></body></html>

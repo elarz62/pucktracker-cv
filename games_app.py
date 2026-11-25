@@ -392,6 +392,27 @@ def web():
         headers.update({"Content-Range": f"bytes {start}-{end}/{size}", "Content-Length": str(end - start + 1)})
         return StreamingResponse(chunks(), status_code=206, headers=headers)
 
+    @api.get("/rink")
+    def rink_page(req: Request):
+        if req.query_params.get("k") == key:
+            r = RedirectResponse("/rink", 303)
+            r.set_cookie("pt", key, max_age=365 * 86400, httponly=True, secure=True, samesite="lax")
+            return r
+        check(req)
+        return HTMLResponse((pathlib.Path("/root/web") / "rink.html").read_text())
+
+    @api.get("/api/games/{game_id}/rink/{name}")
+    def rink_data(game_id: str, name: str, req: Request):
+        check(req)
+        if game_id not in game_ids() or not (name == "meta" or name.isdigit()):
+            raise HTTPException(404)
+        p = game_dir(game_id) / "rink" / f"{name}.json"
+        if not p.exists():
+            reload()
+        if not p.exists():
+            raise HTTPException(404, "Rink view not built for this game yet.")
+        return FileResponse(p, media_type="application/json", headers={"Cache-Control": "private, max-age=300"})
+
     @api.get("/video/{game_id}/master.mp4")
     def master(game_id: str, req: Request):
         check(req)
