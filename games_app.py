@@ -193,7 +193,7 @@ def make_player_video(game_id: str, number: str, pre: float = 3.0, post: float =
 
 # ---------------------------------------------------------------- web app
 
-@app.function(image=image, volumes={str(DATA): vol}, secrets=[modal.Secret.from_name("pucktracker-web")],
+@app.function(image=image, volumes={str(DATA): vol}, secrets=[modal.Secret.from_name("pucktracker-web"), modal.Secret.from_name("pucktracker-rink-link")],
               cpu=1, memory=1024, timeout=60 * 60, scaledown_window=15 * 60,
               max_containers=1)
 @modal.concurrent(max_inputs=50)
@@ -207,10 +207,11 @@ def web():
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     key = os.environ["VIEW_KEY"]
+    keys = {key, os.environ.get("RINK_KEY") or key}
     games_src = pathlib.Path("/root/games")
 
     def check(req: Request):
-        if req.cookies.get("pt") != key and req.query_params.get("k") != key:
+        if req.cookies.get("pt") not in keys and req.query_params.get("k") not in keys:
             raise HTTPException(401, "Open the link you were given.")
 
     def game_ids() -> list:
@@ -234,9 +235,9 @@ def web():
 
     @api.get("/")
     def index(req: Request):
-        if req.query_params.get("k") == key:
+        if req.query_params.get("k") in keys:
             r = RedirectResponse("/", 303)
-            r.set_cookie("pt", key, max_age=365 * 86400, httponly=True, secure=True, samesite="lax")
+            r.set_cookie("pt", req.query_params["k"], max_age=365 * 86400, httponly=True, secure=True, samesite="lax")
             return r
         check(req)
         return HTMLResponse((pathlib.Path("/root/web") / "marker.html").read_text())
@@ -394,9 +395,9 @@ def web():
 
     @api.get("/rink")
     def rink_page(req: Request):
-        if req.query_params.get("k") == key:
+        if req.query_params.get("k") in keys:
             r = RedirectResponse("/rink", 303)
-            r.set_cookie("pt", key, max_age=365 * 86400, httponly=True, secure=True, samesite="lax")
+            r.set_cookie("pt", req.query_params["k"], max_age=365 * 86400, httponly=True, secure=True, samesite="lax")
             return r
         check(req)
         return HTMLResponse((pathlib.Path("/root/web") / "rink.html").read_text())
