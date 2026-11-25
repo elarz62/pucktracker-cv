@@ -203,7 +203,7 @@ def web():
     import time
 
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+    from fastapi.responses import Response, FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     key = os.environ["VIEW_KEY"]
@@ -227,6 +227,15 @@ def web():
             vol.reload()
         except Exception:
             pass
+
+    def rink_read(game_id: str, name: str):
+        """Fresh copy of a rink-view file. Read through the volume API, not this container's mount, which
+        can't reload while a video streams and would serve the dots from before a rebuild."""
+        try:
+            return b"".join(vol.read_file(f"games/{game_id}/rink/{name}"))
+        except Exception:
+            p = game_dir(game_id) / "rink" / name
+            return p.read_bytes() if p.exists() else None
 
     def marks_dir(game_id: str) -> pathlib.Path:
         d = game_dir(game_id) / "marks"
@@ -412,8 +421,7 @@ def web():
         if game_id not in game_ids() or team not in ("w", "b", "r", "x"):
             raise HTTPException(400)
         rd = game_dir(game_id) / "rink"
-        reload()
-        rj = lambda n: json.loads((rd / n).read_text()) if (rd / n).exists() else {}
+        rj = lambda n: json.loads(rink_read(game_id, n) or b"{}")
         dotfix, trackfix, dots = rj("dot_fix.json"), rj("team_fix.json"), rj("dots.json")
         dotfix[dot] = team
         for k in dots.get(dot, []):
@@ -423,23 +431,31 @@ def web():
         vol.commit()
         return {"ok": True, "fixed": len(dotfix)}
 
+    @api.post("/api/games/{game_id}/rink/relearn")
+    def rink_relearn(game_id: str, req: Request):
+        """Retrain the team-color model with every fix so far and rebuild the dots (about 2 minutes)."""
+        check(req)
+        if game_id not in game_ids():
+            raise HTTPException(404)
+        modal.Function.from_name("pucktracker-rink", "build").spawn(game_id, only_produce=True)
+        return {"ok": True}
+
     @api.get("/api/games/{game_id}/rink/dotfix")
     def rink_dotfix(game_id: str, req: Request):
         check(req)
-        p = game_dir(game_id) / "rink" / "dot_fix.json"
-        return JSONResponse(json.loads(p.read_text()) if p.exists() else {}, headers={"Cache-Control": "no-store"})
+        return JSONResponse(json.loads(rink_read(game_id, "dot_fix.json") or b"{}"), headers={"Cache-Control": "no-store"})
 
     @api.get("/api/games/{game_id}/rink/{name}")
     def rink_data(game_id: str, name: str, req: Request):
         check(req)
-        if game_id not in game_ids() or not (name == "meta" or name.isdigit()):
+        if game_id not in game_ids() or not (name in ("meta", "learn") or name.isdigit()):
             raise HTTPException(404)
-        p = game_dir(game_id) / "rink" / f"{name}.json"
-        if not p.exists():
-            reload()
-        if not p.exists():
+        data = rink_read(game_id, f"{name}.json")
+        if data is None:
             raise HTTPException(404, "Rink view not built for this game yet.")
-        return FileResponse(p, media_type="application/json", headers={"Cache-Control": "private, max-age=300"})
+        # minute files are fetched with ?b=<build time>, so they can be cached; meta and learn change on rebuild
+        cache = "private, max-age=3600" if name.isdigit() else "no-store"
+        return Response(data, media_type="application/json", headers={"Cache-Control": cache})
 
     @api.get("/video/{game_id}/master.mp4")
     def master(game_id: str, req: Request):

@@ -85,6 +85,8 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
         <button class="tool" id="tB" aria-pressed="false">+ Blue dot</button>
         <button class="tool" id="tP" aria-pressed="false">+ Puck</button>
         <button class="tool" id="tClear">Clear drawings</button>
+        <button class="tool" id="tRelearn" title="Retrain the team-color model with every fix so far">Relearn colors</button>
+        <span class="status" id="learnState"></span>
         <span class="status">Drawing pauses the video. Drag a placed dot to move it, right-click to remove it. Click a tracked dot to fix its team.</span>
       </div>
     </section>
@@ -126,7 +128,7 @@ document.getElementById('notes').innerHTML=`<h3>How to read it</h3>
 </ul>`;
 async function getMin(m){
   if(MIN[m]||pending[m]||m<0||!META||m>=META.minutes) return MIN[m];
-  pending[m]=fetch(`/api/games/${GAME}/rink/${m}`).then(r=>r.ok?r.json():null).then(d=>{
+  pending[m]=fetch(`/api/games/${GAME}/rink/${m}?b=${META.built||0}`).then(r=>r.ok?r.json():null).then(d=>{
     if(d){d.times=d.frames.map(f=>f[0]); d.maps=d.frames.map(f=>{const mp=new Map(); for(const p of f[1]) mp.set(p[0],p); return mp});}
     MIN[m]=d||{times:[],maps:[],cam_t:[],H:[],foot:[],good:[]}; delete pending[m]; draw(); return MIN[m]});
   return null;
@@ -135,12 +137,20 @@ async function loadGame(id){
   GAME=id; MIN={}; drawings=[]; placed=[]; DOTFIX={};
   fetch(`/api/games/${id}/rink/dotfix`).then(r=>r.ok?r.json():{}).then(d=>{DOTFIX=d||{}; draw()});
   document.querySelectorAll('#tabs button').forEach(b=>b.setAttribute('aria-pressed',b.dataset.id===id));
-  const r=await fetch(`/api/games/${id}/rink/meta`);
+  const r=await fetch(`/api/games/${id}/rink/meta?v=${Date.now()}`);
   if(!r.ok){META=null; document.getElementById('count').textContent='Rink view not built for this game yet'; vid.removeAttribute('src'); draw(); return}
   META=await r.json(); vid.src=`/video/${id}/master.mp4`; scrub.max=META.duration;
   document.getElementById('gameName').textContent=document.querySelector(`#tabs button[data-id="${id}"]`)?.textContent||id;
-  getMin(0); draw();
+  getMin(0); draw(); showLearn();
 }
+async function showLearn(){const el=document.getElementById('learnState'); try{const r=await fetch(`/api/games/${GAME}/rink/learn?v=${Date.now()}`); if(!r.ok){el.textContent='';return} const L=await r.json();
+  el.textContent=`Team model: learned from ${L.fixes} of your fixes and ${L.tags} jersey tags`+(L.learned_right_pct?`, our players colored right ${L.rules_right_pct}% → ${L.learned_right_pct}%.`:'.')}catch(_){el.textContent=''}}
+document.getElementById('tRelearn').onclick=async()=>{const btn=document.getElementById('tRelearn'), el=document.getElementById('learnState'); const before=META&&META.built;
+  btn.disabled=true; el.textContent='Relearning colors from your fixes… about a minute.';
+  try{const r=await fetch(`/api/games/${GAME}/rink/relearn`,{method:'POST'}); if(!r.ok) throw 0}catch(_){el.textContent='Could not start relearning. Try again.'; btn.disabled=false; return}
+  const t0=Date.now(); const poll=async()=>{ if(Date.now()-t0>8*60e3){el.textContent='Still working. Reload the page in a few minutes.'; btn.disabled=false; return}
+    try{const m=await (await fetch(`/api/games/${GAME}/rink/meta?v=${Date.now()}`)).json(); if(m.built&&m.built!==before){const t=vid.currentTime; await loadGame(GAME); vid.addEventListener('loadedmetadata',()=>{vid.currentTime=t},{once:true}); btn.disabled=false; return}}catch(_){}
+    setTimeout(poll,10000)}; setTimeout(poll,20000)};
 fetch('/api/games').then(r=>r.json()).then(gs=>{const tabs=document.getElementById('tabs');
   for(const g of gs){const b=document.createElement('button'); b.textContent=g.title||g.id; b.dataset.id=g.id; b.onclick=()=>loadGame(g.id); tabs.appendChild(b)}
   loadGame(GAME)});

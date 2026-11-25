@@ -24,7 +24,7 @@ DATA = pathlib.Path("/data")
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "libgl1", "libglib2.0-0")
-    .pip_install("opencv-python-headless==4.10.0.84", "numpy==1.26.4", "scipy==1.13.1", "pandas==2.2.3")
+    .pip_install("opencv-python-headless==4.10.0.84", "numpy==1.26.4", "scipy==1.13.1", "pandas==2.2.3", "scikit-learn==1.5.2")
     .add_local_dir(pathlib.Path(__file__).parent / "refs", "/root/refs")
     .add_local_dir(pathlib.Path(__file__).parent.parent / "games", "/root/games")
 )
@@ -328,6 +328,54 @@ def map_chunk(game_id: str, part: int, file: str, t0: float, t1: float, fps_src:
     return {"part": part, "t0": t0, "poses": poses, "quals": quals, "src": src, "feats": feats_rows}
 
 
+def color_feat(hsv, lab):
+    """Jersey color signature of a torso crop: hue x saturation histogram of lit pixels, mean Lab,
+    share of dark and of white pixels."""
+    import numpy as np
+    h, sat, v = hsv[..., 0].ravel(), hsv[..., 1].ravel(), hsv[..., 2].ravel()
+    lit = v > 50
+    hist = np.histogram2d(h[lit], np.minimum(sat[lit], 255), bins=[12, 3], range=[[0, 180], [0, 256]])[0].ravel()
+    hist = hist / max(hist.sum(), 1)
+    L = lab.reshape(-1, 3).mean(0) / 255.0
+    return np.r_[hist, L, (v < 60).mean(), ((sat < 40) & (v > 150)).mean()].astype(np.float32)
+
+
+@app.function(image=image, volumes={str(DATA): vol}, cpu=2, memory=4096, timeout=3600)
+def color_chunk(game_id: str, part: int, file: str, t0: float, t1: float, fps_src: float) -> dict:
+    """Jersey color samples for every tracker box, 2 frames a second, straight from the source video."""
+    import cv2
+    import numpy as np
+    import pandas as pd
+    stem = pathlib.Path(file).stem
+    tr = pd.read_csv(DATA / "out" / stem / "tracks.csv", usecols=["frame", "track_id", "x1", "y1", "x2", "y2"])
+    tr = tr[(tr.frame >= (t0 - 1) * fps_src) & (tr.frame <= (t1 + 1) * fps_src)]
+    byf = {f: g for f, g in tr.groupby("frame")}
+    cmd = ["ffmpeg", "-v", "error", "-ss", str(t0), "-i", str(DATA / "videos" / file), "-t", str(t1 - t0),
+           "-vf", "fps=2", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    out, n = {}, 0
+    while True:
+        buf = proc.stdout.read(1920 * 1080 * 3)
+        if len(buf) < 1920 * 1080 * 3:
+            break
+        bgr = np.frombuffer(buf, np.uint8).reshape(1080, 1920, 3)
+        g = byf.get(int(round((t0 + n / 2.0) * fps_src)))
+        n += 1
+        if g is None:
+            continue
+        for rw in g.itertuples():
+            x1, y1, x2, y2 = max(int(rw.x1), 0), max(int(rw.y1), 0), min(int(rw.x2), 1919), min(int(rw.y2), 1079)
+            h, w = y2 - y1, x2 - x1
+            if h < 24 or w < 6:
+                continue
+            crop = bgr[y1 + int(0.12 * h):y1 + int(0.55 * h), x1 + int(0.2 * w):x2 - int(0.2 * w)]
+            if crop.size == 0:
+                continue
+            f = color_feat(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), cv2.cvtColor(crop, cv2.COLOR_BGR2LAB))
+            out.setdefault((part, int(rw.track_id)), []).append(f)
+    return out
+
+
 @app.function(image=image, volumes={str(DATA): vol}, cpu=4, memory=16384, timeout=4 * 3600)
 def build(game_id: str, chunk: float = 60.0, link_s: float = 1.5, hold_end_s: float = 1.0, only_produce: bool = False) -> dict:
     import numpy as np
@@ -354,12 +402,101 @@ def build(game_id: str, chunk: float = 60.0, link_s: float = 1.5, hold_end_s: fl
         res = list(map_chunk.starmap(jobs, order_outputs=True))
         cache.write_bytes(pickle.dumps(res))
         vol.commit()
-    stats = produce(game_id, game, res, fps, out, link_s, hold_end_s)
+    cpath = out / "colors.pkl"
+    if not cpath.exists():
+        jobs = []
+        for i, p in enumerate(game["parts"]):
+            t = float(p["start"])
+            while t < p["end"]:
+                jobs.append((game_id, i, p["file"], t, min(t + chunk, float(p["end"])), fps[i]))
+                t += chunk
+        colors = {}
+        for d in color_chunk.starmap(jobs, order_outputs=True):
+            for k, v in d.items():
+                colors.setdefault(k, []).extend(v)
+        colors = {k: np.median(np.array(v), 0) for k, v in colors.items() if len(v)}
+        cpath.write_bytes(pickle.dumps(colors))
+        vol.commit()
+    colors = pickle.loads(cpath.read_bytes())
+    stats = produce(game_id, game, res, fps, out, link_s, hold_end_s, colors=colors)
     vol.commit()
     return stats
 
 
-def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merge_ft=3.0, dup_ft=2.0, dup_share=0.9, dup_min_s=1.0, cap={'w': 6, 'b': 6, 'r': 3}):
+def learn_teams(game_id, team, fixes, feats, hmed, colors, out):
+    """Team-color model trained on every player's jersey colors.
+
+    Labels, weakest to strongest: the color rules (weight 1), jersey-number tags from the Shift Marker
+    (all our team, weight 10), and click-fixes from the rink page (weight 30). Players the model is sure
+    about (>= 0.75) and that disagree with the rules get re-colored; click-fixes are applied on top by
+    the caller, so they always win. Scored honestly: 5-fold, each tagged player is predicted by a model
+    that never saw its tag."""
+    import numpy as np
+    import pickle
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.pipeline import make_pipeline
+    keys = [k for k in colors if k in feats and k in team]
+    if not keys:
+        return {"changed": {}, "fixes": len(fixes), "note": "no color samples"}
+    game = json.loads((pathlib.Path("/root/games") / f"{game_id}.json").read_text())
+    ours = "b" if str(game.get("jersey", game.get("team_color", "white"))).startswith("b") else "w"
+
+    def xrow(k):
+        v = np.array(feats[k])
+        return np.r_[colors[k], np.median(v[:, 0]), np.log(max(np.median(v[:, 1]), 0.5) / hmed)]
+    X = np.array([xrow(k) for k in keys])
+    pk = lambda a: (int(a.split(":")[0]), int(a.split(":")[1]))
+    fx = {pk(a): t for a, t in fixes.items()}
+    tp = DATA / "games" / game_id / "tags.json"
+    tags = {pk(a): ours for a, v in (json.loads(tp.read_text()) if tp.exists() else {}).items() if str(v).isdigit()}
+    rules = np.array([team[k] for k in keys])
+    y = np.array([fx.get(k, tags.get(k, team[k])) for k in keys])
+    wt = np.array([30.0 if k in fx else 10.0 if k in tags else 1.0 for k in keys])
+
+    def fit(mask):
+        m = make_pipeline(StandardScaler(), LogisticRegression(C=0.5, max_iter=3000, class_weight="balanced"))
+        m.fit(X[mask], y[mask], logisticregression__sample_weight=wt[mask])
+        return m
+
+    def relabel(m, idx):
+        P = m.predict_proba(X[idx])
+        cls = np.array(m.classes_)
+        j = P.argmax(1)
+        pred = cls[j]
+        sure = (P[np.arange(len(idx)), j] >= 0.75) & np.isin(pred, ["w", "b", "r"])
+        return np.where(sure, pred, rules[idx])
+
+    tag_idx = np.array([i for i, k in enumerate(keys) if k in tags and k not in fx])
+    ev = {}
+    if len(tag_idx) >= 20:
+        rng = np.random.default_rng(0)
+        fold = rng.integers(0, 5, len(tag_idx))
+        got = np.empty(len(tag_idx), dtype=object)
+        for f_ in range(5):
+            hide = tag_idx[fold == f_]
+            mask = np.ones(len(keys), bool)
+            mask[hide] = False
+            got[fold == f_] = relabel(fit(mask), hide)
+        n_ = len(tag_idx)
+        ev = {"tagged_players": int(n_), "rules_right_pct": round(100 * float((rules[tag_idx] == ours).mean()), 1),
+              "learned_right_pct": round(100 * float((got == ours).mean()), 1)}
+    m = fit(np.ones(len(keys), bool))
+    new = relabel(m, np.arange(len(keys)))
+    changed = {k: str(new[i]) for i, k in enumerate(keys) if new[i] != rules[i]}
+    (out / "team_model.pkl").write_bytes(pickle.dumps({"model": m, "classes": list(m.classes_)}))
+    # keep every labeled color signature so later games can start from all of them
+    lib = DATA / "models" / "team_fixes"
+    lib.mkdir(parents=True, exist_ok=True)
+    (lib / f"{game_id}.pkl").write_bytes(pickle.dumps({k: (X[i], y[i], wt[i]) for i, k in enumerate(keys) if wt[i] > 1}))
+    info = {"fixes": len(fx), "tags": len(tags), "players": len(keys), "recolored": len(changed),
+            "recolored_to": {c: sum(v == c for v in changed.values()) for c in "wbr"}, **ev}
+    (out / "learn_changes.json").write_text(json.dumps({f"{k[0]}:{k[1]}": [str(rules[keys.index(k)]), v] for k, v in changed.items()}))
+    (out / "learn.json").write_text(json.dumps({**info, "built": __import__("time").time()}))
+    return {**info, "changed": changed}
+
+
+def produce(game_id, game, res, fps, out, link_s, hold_end_s, colors=None, min_life=0.6, merge_ft=3.0, dup_ft=2.0, dup_share=0.9, dup_min_s=1.0, cap={'w': 6, 'b': 6, 'r': 3}):
     import numpy as np
     import pandas as pd
     from scipy.spatial.transform import Rotation as Rot, Slerp
@@ -412,6 +549,9 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merg
     # team fixes made by clicking dots on the /rink page (track key "part:tid" -> team)
     fixp = DATA / "games" / game_id / "rink" / "team_fix.json"
     fixes = json.loads(fixp.read_text()) if fixp.exists() else {}
+    learn = learn_teams(game_id, team, fixes, feats, hmed, colors or {}, out)
+    for k_, v_ in learn.pop("changed").items():
+        team[k_] = v_
     for k_, v_ in fixes.items():
         pp, tt = k_.split(":")
         team[(int(pp), int(tt))] = v_
@@ -610,12 +750,12 @@ def produce(game_id, game, res, fps, out, link_s, hold_end_s, min_life=0.6, merg
                 fp.append([])
         (out / f"{m}.json").write_text(json.dumps({"frames": fr, "cam_t": ts, "H": Hs, "foot": fp, "good": gd}, separators=(",", ":")))
     meta = {"game": game_id, "duration": duration, "minutes": nmin, "k1": k1,
-            "dims": {"W": W, "blue": b, "doty": dy, "goal": g}, "link_s": link_s, "hold_end_s": hold_end_s}
+            "dims": {"W": W, "blue": b, "doty": dy, "goal": g}, "link_s": link_s, "hold_end_s": hold_end_s, "built": __import__("time").time()}
     (out / "meta.json").write_text(json.dumps(meta))
     src = [s for r in res for s in r["src"]]
     return {"camera_samples": len(cam), "good_pct": round(100 * float(cam_good.mean()), 1),
             "anchor_pct": round(100 * src.count("anchor") / max(len(src), 1), 1), "segments": len(segs),
-            "links": len(nxt), "dots": did, "dup_pairs": len(dup_pairs), "dup_rows_dropped": n_dup_rows, "teams": {t: list(team.values()).count(t) for t in "wbr"},
+            "links": len(nxt), "dots": did, "learn": learn, "dup_pairs": len(dup_pairs), "dup_rows_dropped": n_dup_rows, "teams": {t: list(team.values()).count(t) for t in "wbr"},
             "bad_minutes": [int(m) for m in range(nmin) if ((cam_t >= m * 60) & (cam_t < (m + 1) * 60)).any()
                             and cam_good[(cam_t >= m * 60) & (cam_t < (m + 1) * 60)].mean() < 0.8]}
 
